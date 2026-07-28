@@ -326,13 +326,26 @@ class SX126xRadio:
                  pin_irq=16,
                  pin_txen=-1,
                  pin_rxen=-1,
+                 pin_cs=-1,
                  gpiochip="gpiochip0",
                  dio3_tcxo_voltage=None,
                  dio3_tcxo_delay_ms=5,
                  busy_timeout_ms=5000,
                  ):
         """Configure but do *not* open any hardware yet. Call open() to bring
-        the chip up; call close() to put it to sleep and release resources."""
+        the chip up; call close() to put it to sleep and release resources.
+
+        pin_cs : gpiochip line offset for the SX126x NSS (active-low chip
+                 select) line. Set to >= 0 to enable bit-banged CS over
+                 libgpiod. This is REQUIRED on platforms where the SPI
+                 controller has no hardware CS pin wired (e.g. Raspberry Pi
+                 with the `spi0-0cs` device-tree overlay, where spidev's
+                 hardware-CE toggling goes nowhere at the silicon level).
+                 Set to -1 to defer CS entirely to spidev's hardware-CE
+                 path (works when the SPI controller's CE pin is wired to
+                 the chip's NSS, e.g. some onboard SX126x modules with a
+                 hardwired CE<->NSS connection, or via
+                 `dtoverlay=spi0-1cs,cs0_pin=<n>`)."""
         if spidev is None:
             raise SX126xError("spidev module not available; install python3-spidev")
         if gpiod is None:
@@ -346,6 +359,7 @@ class SX126xRadio:
         self.pin_irq       = pin_irq
         self.pin_txen      = pin_txen
         self.pin_rxen      = pin_rxen
+        self.pin_cs        = pin_cs
         self.gpiochip_name = gpiochip
         self.dio3_tcxo_voltage = dio3_tcxo_voltage
         self.dio3_tcxo_delay_ms = dio3_tcxo_delay_ms
@@ -359,6 +373,7 @@ class SX126xRadio:
         self._line_irq     = None
         self._line_txen    = None
         self._line_rxen    = None
+        self._line_cs      = None   # bit-banged NSS if pin_cs >= 0
 
         # IRQ wait synchronization: a single consumer is expected per
         # wait_irq_done() call (matching LoRaRF's single-shot TX/RX model).
@@ -384,9 +399,34 @@ class SX126xRadio:
         self._spi.max_speed_hz = self.spi_speed
         self._spi.mode = 0          # CPOL=0, CPHA=0 per SX126x datasheet
         self._spi.lsbfirst = False   # MSB first
+        # If we're bit-banging CS via libgpiod, tell spidev NOT to drive its
+        # own (unwired) hardware CE pin. spidev toggles the CE pin anyway
+        # by default; setting no_cs=True suppresses that to keep the bus
+        # state clean and predictable. Safe even when spidev's CE pin is
+        # wired to NSS — the bit-banged line wins regardless.
+        if self.pin_cs is not None and self.pin_cs >= 0:
+            try:
+                self._spi.no_cs = True
+            except Exception:
+                # Older spidev versions may not support this attribute; in
+                # that case spidev's hardware CE toggles a pin that goes
+                # nowhere on a `spi0-0cs` overlay, so it's harmless.
+                pass
 
         # --- GPIO chip ---
         self._chip = gpiod.Chip(self.gpiochip_name)
+
+        # --- CS / NSS (active-low chip-select, driven LOW per SPI transaction
+        #     if pin_cs was configured; otherwise spidev's hardware-CE handles
+        #     it). Idle state is HIGH so the SX126x ignores the bus between
+        #     transactions. ---
+        if self.pin_cs is not None and self.pin_cs >= 0:
+            self._line_cs = self._chip.get_line(self.pin_cs)
+            self._line_cs.request(
+                consumer="sx126x-cs",
+                type=gpiod.LINE_REQ_DIR_OUT,
+                default_val=self.HIGH,   # idle (de-asserted)
+            )
 
         # --- RESET (output, default high so we start de-asserted) ---
         #
@@ -486,7 +526,8 @@ class SX126xRadio:
             except Exception:
                 pass
 
-        for line in (self._line_irq, self._line_txen, self._line_rxen,
+        for line in (self._line_cs,    # release before the others so the
+                     self._line_irq, self._line_txen, self._line_rxen,
                      self._line_busy, self._line_reset):
             if line is not None:
                 try:
@@ -502,6 +543,7 @@ class SX126xRadio:
 
         self._line_reset = self._line_busy = self._line_irq = None
         self._line_txen  = self._line_rxen  = None
+        self._line_cs    = None
         self._chip       = None
         self._spi        = None
 
@@ -542,7 +584,15 @@ class SX126xRadio:
         if self._wait_busy(self.busy_timeout_ms) is False:
             raise SX126xTimeout("BUSY pin stayed high before opcode 0x{:02x}".format(opcode))
         buf = bytes([opcode]) + (data if isinstance(data, (bytes, bytearray)) else bytes(data))
-        self._spi.xfer2(list(buf))
+        if self._line_cs is not None:
+            # Bit-banged CS (active-low). Assert LOW, transaction, deassert HIGH.
+            self._line_cs.set_value(self.LOW)
+            try:
+                self._spi.xfer2(list(buf))
+            finally:
+                self._line_cs.set_value(self.HIGH)
+        else:
+            self._spi.xfer2(list(buf))
 
     def _spi_read(self, opcode, address=b"", n_data=1):
         """Issue a read SX126x command: [opcode, address..., 0x00 * n_data].
@@ -553,7 +603,14 @@ class SX126xRadio:
             raise SX126xTimeout("BUSY pin stayed high before opcode 0x{:02x}".format(opcode))
         n_addr = len(address)
         buf = bytes([opcode]) + bytes(address) + (b"\x00" * n_data)
-        feedback = self._spi.xfer2(list(buf))
+        if self._line_cs is not None:
+            self._line_cs.set_value(self.LOW)
+            try:
+                feedback = self._spi.xfer2(list(buf))
+            finally:
+                self._line_cs.set_value(self.HIGH)
+        else:
+            feedback = self._spi.xfer2(list(buf))
         # feedback[0] is the status byte; feedback[1..n_addr] echo address;
         # feedback[n_addr+1 ..] is the requested data.
         return bytes(feedback[n_addr + 1:])

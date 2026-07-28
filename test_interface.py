@@ -607,14 +607,17 @@ assert inst_pi.pin_lines["busy"] == ("gpiochip0", 20), f"busy={inst_pi.pin_lines
 assert inst_pi.pin_lines["reset"]== ("gpiochip0", 18), f"reset={inst_pi.pin_lines['reset']}"
 assert inst_pi.pin_lines["txen"] == ("gpiochip0", 13), f"txen={inst_pi.pin_lines['txen']}"
 assert inst_pi.pin_lines["rxen"] == ("gpiochip0", 12), f"rxen={inst_pi.pin_lines['rxen']}"
+# CS must also resolve — physical pin 40 → BCM21 → gpiochip0 line 21
+assert inst_pi.pin_lines["cs"] == ("gpiochip0", 21), f"cs={inst_pi.pin_lines['cs']}"
+assert inst_pi.pin_cs == 21, f"pin_cs={inst_pi.pin_cs}"
 assert inst_pi.spi_bus == 0 and inst_pi.spi_cs == 0
 assert inst_pi.platform_name == "raspberry-pi"
 assert inst_pi.board_name == "meshadv-pi-hat-v1.1"
 assert inst_pi.resolution["used_profile_mode"] is True
 print(f"[OK] Pi + MeshAdv HAT: gpiochip={inst_pi.gpiochip}, "
-      f"irq={inst_pi.pin_lines['irq']}, busy={inst_pi.pin_lines['busy']}, "
-      f"reset={inst_pi.pin_lines['reset']}, txen={inst_pi.pin_lines['txen']}, "
-      f"rxen={inst_pi.pin_lines['rxen']}")
+      f"cs={inst_pi.pin_lines['cs']}, irq={inst_pi.pin_lines['irq']}, "
+      f"busy={inst_pi.pin_lines['busy']}, reset={inst_pi.pin_lines['reset']}, "
+      f"txen={inst_pi.pin_lines['txen']}, rxen={inst_pi.pin_lines['rxen']}")
 
 # Verify the NOTICE log mentioned platform + board
 log_msgs = [e.msg for e in FakeRNS.logs if "profile resolution" in e.msg.lower()]

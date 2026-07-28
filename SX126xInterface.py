@@ -222,12 +222,19 @@ PLATFORM_PROFILES = {
         "notes": (
             "Standard Raspberry Pi 3/4/5 40-pin header. BCM GPIO numbers "
             "are the libgpiod line offsets on gpiochip0, so the table just "
-            "uses the BCM number per physical pin. The MeshAdv Pi HAT uses "
-            "CS=BCM21 (physical pin 40), which is NOT a native SPI0 CE "
-            "line; users need `dtoverlay=spi0-1cs,cs0_pin=21` in "
-            "/boot/firmware/config.txt to route SPI0 CE0 onto GPIO21. That "
-            "is a platform-level (SBC SPI-controller) caveat, not a board-"
-            "level wiring fact."
+            "uses the BCM number per physical pin. "
+            "Re: chip-select on the MeshAdv Pi HAT (CS=BCM21 / physical 40): "
+            "this is NOT a native SPI0 CE line. The Pi's typical SPI overlay "
+            "is `dtoverlay=spi0-0cs` (zero hardware CS lines) — verified on "
+            "Pi OS Bookworm on a real Pi Zero 2W. In that configuration "
+            "spidev's hardware-CE toggling has no physical pin to drive and "
+            "the SX126x chip never sees CS, so the driver bit-bangs CS via "
+            "libgpiod on BCM21 instead. If a user prefers to use the "
+            "controller's hardware-CE for CS, they can switch the overlay "
+            "to `dtoverlay=spi0-1cs,cs0_pin=21` (routes CE0 onto GPIO21) "
+            "and set `header_pin_cs = -1` in the board profile — but the "
+            "bit-bang path works without any /boot/firmware/config.txt edit "
+            "or reboot, so it is the default."
         ),
     },
 
@@ -275,8 +282,14 @@ PLATFORM_PROFILES = {
 BOARD_PROFILES = {
     "meshadv-pi-hat-v1.1": {
         "board_name":        "meshadv-pi-hat-v1.1",
-        "profile_version":   1,
-        "header_pin_cs":     -1,    # CS handled by spidev via SPI CE, not GPIO
+        "profile_version":   2,
+        # CS / NSS: physical pin 40 → BCM21. The MeshAdv HAT does NOT have
+        # its CS pin wired to the Pi's native SPI0 CE0 (GPIO8). The Pi's
+        # device tree overlay is typically `dtoverlay=spi0-0cs` (zero
+        # hardware chip-select lines), in which case spidev's hardware-CE
+        # toggling has no physical pin to drive and the chip never sees
+        # CS. So the driver MUST bit-bang CS via libgpiod on this GPIO.
+        "header_pin_cs":     40,
         "header_pin_irq":    36,    # physical pin 36 → BCM16 (gpiochip0 line 16)
         "header_pin_busy":   38,    # physical pin 38 → BCM20 (line 20)
         "header_pin_reset":  12,    # physical pin 12 → BCM18 (line 18)
@@ -293,9 +306,14 @@ BOARD_PROFILES = {
             "MeshAdv Pi HAT v1.1 with Ebyte E22-900M30S SX1262 module. "
             "E22 module drives its RF switch via DIO2, so set_dio2_as_rf_"
             "switch_ctrl is enabled and the external TXEN/RXEN GPIOs are "
-            "wired but optional. Module uses a TCXO on DIO3 at 1.8V. CS "
-            "GPIO (BCM21 / physical 40) is NOT a native SPI0 CE — see the "
-            "raspberry-pi platform profile's notes for the dtoverlay line."
+            "wired but optional. Module uses a TCXO on DIO3 at 1.8V. "
+            "CS/NSS is wired to BCM21 (physical pin 40), which is NOT a "
+            "native SPI0 CE line — the Pi's dtoverlay is typically "
+            "`spi0-0cs` (zero hardware CS lines), so the driver bit-bangs "
+            "CS via libgpiod on this GPIO instead of relying on spidev's "
+            "hardware-CE (which would toggle a pin that goes nowhere). "
+            "This was verified on a real Raspberry Pi Zero 2W running "
+            "Raspberry Pi OS Bookworm with `dtoverlay=spi0-0cs`."
         ),
     },
 
@@ -353,7 +371,7 @@ BOARD_PROFILES = {
 
 
 # Pin field names that participate in header-pin resolution.
-_PIN_FIELDS = ("irq", "busy", "reset", "txen", "rxen")
+_PIN_FIELDS = ("cs", "irq", "busy", "reset", "txen", "rxen")
 
 # Special board name that triggers the escape hatch.
 _CUSTOM_BOARD_NAME = "custom"
@@ -915,6 +933,7 @@ class SX126xInterface(Interface):
         def _line_of(field):
             v = self.pin_lines.get(field)
             return -1 if v is None else v[1]
+        self.pin_cs    = _line_of("cs")
         self.pin_irq   = _line_of("irq")
         self.pin_busy  = _line_of("busy")
         self.pin_reset = _line_of("reset")
@@ -1099,6 +1118,7 @@ class SX126xInterface(Interface):
             pin_irq=self.pin_irq,
             pin_txen=self.pin_txen,
             pin_rxen=self.pin_rxen,
+            pin_cs=self.pin_cs,
             gpiochip=self.gpiochip,
             dio3_tcxo_voltage=self.dio3_tcxo if self.dio3_tcxo and self.dio3_tcxo > 0 else None,
             dio3_tcxo_delay_ms=self.tcxo_delay_ms,
