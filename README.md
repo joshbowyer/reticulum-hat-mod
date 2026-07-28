@@ -9,10 +9,11 @@ Designed for the **MeshAdv Pi HAT v1.1** but works with any SPI-connected SX126x
 Normally, Reticulum requires a separate RNode device (an ESP32 or nRF52 running RNode firmware) connected via USB serial. This interface eliminates that second device by talking directly to the SX1262 LoRa chip over the Pi's SPI bus.
 
 It implements:
-- **Direct SPI control** via the [LoRaRF-Python](https://github.com/chandrawi/LoRaRF-Python) library
-- **CSMA/CA** collision avoidance (p-persistent, like RNode firmware)
+- **Direct SPI control** via a vendored SX126x driver on raw spidev + libgpiod 1.6
+- **CSMA/CA** with **CAD-based** carrier sense (replaces the old stale-RSSI check)
 - **RNode-compatible split-packet framing** so the full 500-byte Reticulum MTU works over the 255-byte LoRa frame limit
-- **Airtime tracking and limiting**
+- **Airtime tracking and limiting** with sliding-window accounting (no spike-after-reset artifact)
+- **Radio lockup recovery** (escalating reinit, then offline)
 - **Interoperability** with standard RNodes on the same frequency/parameters
 
 ## Requirements
@@ -36,22 +37,25 @@ Reboot if SPI wasn't already enabled.
 ### 2. Install dependencies
 
 ```bash
-pip install rns LoRaRF
+pip install rns
 ```
 
-Or if your OS restricts pip:
+The driver depends only on stdlib Python plus `spidev` and `gpiod`
+(provided by Debian/Ubuntu packages `python3-spidev` and `python3-libgpiod`).
+Install those via your OS package manager:
 
 ```bash
-pip install rns LoRaRF --break-system-packages
+sudo apt install python3-spidev python3-libgpiod
 ```
 
 ### 3. Install the interface module
 
-Copy `SX126xInterface.py` to the Reticulum custom interfaces directory:
+Copy **both** `SX126xInterface.py` and `vendored_sx126x.py` to the
+Reticulum custom interfaces directory:
 
 ```bash
 mkdir -p ~/.reticulum/interfaces
-cp SX126xInterface.py ~/.reticulum/interfaces/
+cp SX126xInterface.py vendored_sx126x.py ~/.reticulum/interfaces/
 ```
 
 ### 4. Configure Reticulum
@@ -69,11 +73,10 @@ Edit `~/.reticulum/config` and add an interface block. If the file doesn't exist
   spreadingfactor = 8
   codingrate = 5
   txpower = 22
-  # SPI
+  # SPI — spi_cs is the spidev chip-select index (CE0=0, CE1=1), NOT a GPIO.
   spi_bus = 0
   spi_cs = 0
   # GPIO pins (BCM numbering) — MeshAdv Pi HAT defaults
-  pin_cs = 21
   pin_irq = 16
   pin_busy = 20
   pin_reset = 18
@@ -96,7 +99,6 @@ Edit `~/.reticulum/config` and add an interface block. If the file doesn't exist
   txpower = 22
   spi_bus = 0
   spi_cs = 0
-  pin_cs = 21
   pin_irq = 16
   pin_busy = 20
   pin_reset = 18
@@ -162,8 +164,7 @@ The Waveshare HAT uses a UART-based E22 module, **not** direct SPI. It is **not 
 | `codingrate` | 5 | LoRa CR denominator (5-8 = 4/5 to 4/8) |
 | `txpower` | 22 | TX power in dBm (-9 to 22) |
 | `spi_bus` | 0 | SPI bus number |
-| `spi_cs` | 0 | SPI chip select |
-| `pin_cs` | 21 | BCM GPIO for chip select |
+| `spi_cs` | 0 | SPI chip-select index (spidev CE0=0, CE1=1) |
 | `pin_irq` | 16 | BCM GPIO for IRQ (DIO1) |
 | `pin_busy` | 20 | BCM GPIO for BUSY |
 | `pin_reset` | 18 | BCM GPIO for RESET |
@@ -225,9 +226,8 @@ rnstatus
 - Check that SPI is enabled: `ls /dev/spidev*` should show at least `spidev0.0`
 - Check wiring — make sure the HAT is fully seated
 - Ensure the antenna is connected (the E22 module can fail to init without a load)
-
-**"LoRaRF library not found"**
-- Run `pip install LoRaRF`
+- Verify `python3-libgpiod` and `python3-spidev` are installed
+- Confirm `vendored_sx126x.py` is in `~/.reticulum/interfaces/` alongside `SX126xInterface.py`
 
 **No packets received**
 - Verify frequency, bandwidth, SF, and CR match the other node exactly
@@ -256,18 +256,19 @@ rnstatus
 │  │  Sideband /   │     │   SX126xInterface    │  │
 │  │  NomadNet /   │◄───►│   (this module)      │  │
 │  │  MeshChat     │     │                      │  │
-│  │               │     │  ┌─────────────────┐ │  │
-│  └───────────────┘     │  │ CSMA/CA engine  │ │  │
-│         ▲              │  │ Split-pkt frame │ │  │
-│         │              │  │ Airtime tracker │ │  │
-│  ┌──────┴──────┐       │  └────────┬────────┘ │  │
-│  │ Reticulum   │       │           │ SPI      │  │
-│  │ (rnsd)      │◄─────►│           ▼          │  │
-│  └─────────────┘       │  ┌─────────────────┐ │  │
-│                        │  │  LoRaRF-Python  │ │  │
-│                        │  │  (SX126x drv)   │ │  │
-│                        │  └────────┬────────┘ │  │
-│                        └───────────┼──────────┘  │
+│  │               │     │   TX queue (Queue)   │  │
+│  └───────────────┘     │         ▲            │  │
+│         ▲              │         │ non-block  │  │
+│         │              │         │ enqueue    │  │
+│  ┌──────┴──────┐       │  ┌──────┴─────────┐  │  │
+│  │ Reticulum   │       │  │  radio thread  │  │  │
+│  │ (rnsd)      │◄─────►│  │  (SINGLE       │  │  │
+│  │  Transport  │       │  │   radio owner) │  │  │
+│  │  thread     │       │  │   CSMA+CAD      │  │  │
+│  └─────────────┘       │  │   split framing │  │  │
+│                        │  │   airtime acct. │  │  │
+│                        │  └────────┬─────────┘  │  │
+│                        └───────────┼────────────┘  │
 │                                    │ SPI+GPIO    │
 ├────────────────────────────────────┼─────────────┤
 │  MeshAdv Pi HAT                    ▼             │
@@ -277,6 +278,15 @@ rnstatus
 │  └──────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────┘
 ```
+
+Key concurrency invariant: **only one thread ever touches the radio**.
+The `process_outgoing` method (called by Reticulum's Transport thread)
+merely enqueues the frame onto a thread-safe `queue.Queue` and returns
+immediately — no blocking, no CSMA wait, no TX. A dedicated **radio-owner
+thread** drains the queue and is the sole caller of every SX126x command.
+This eliminates the TX/RX race that plagued the older implementation.
+The thread blocks on the SX126x IRQ line via libgpiod edge events
+(vendored driver; no busy-spin), so idle RX costs effectively zero CPU.
 
 ### Split-Packet Framing
 
@@ -303,7 +313,7 @@ This is a community project filling a gap in the Reticulum ecosystem. If you tes
 
 - [Mark Qvist](https://github.com/markqvist) for Reticulum and the RNode platform
 - [Chris Myers](https://github.com/chrismyers2000) for the MeshAdv Pi HAT
-- [chandrawi](https://github.com/chandrawi/LoRaRF-Python) for the LoRaRF-Python library
+- [chandrawi](https://github.com/chandrawi/LoRaRF-Python) for the LoRaRF-Python library (whose command opcodes the vendored driver mirrors byte-for-byte)
 - [varna9000](https://github.com/varna9000/micropython-reticulum) for the micropython-reticulum SX1262 interface which validated the split-packet framing approach
 - The Reticulum Discussion #652 community for pushing for SPI HAT support
 
