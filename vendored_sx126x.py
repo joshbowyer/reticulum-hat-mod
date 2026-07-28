@@ -1013,10 +1013,15 @@ class SX126xRadio:
         elif tx_power_dbm >= 10 and version == TX_POWER_SX1268:
             pa_duty_cycle, hp_max, power = 0x00, 0x03, 0x0F
         else:
-            # Below the lowest band (or unsupported combination) — leave
-            # at the conservative defaults so we don't accidentally blast
-            # full power. Caller is responsible for not asking nonsense.
-            pass
+            # Below the lowest band (or unsupported combination). SX1262
+            # datasheet doesn't list a valid SetTxParams + SetPaConfig pair
+            # for these values — calling it with an inconsistent state
+            # (e.g. paDutyCycle=0 with a non-zero power register) causes the
+            # chip to reject the next SetTx with "command execution failed"
+            # (status 0x2a). Match LoRaRF-Python and do nothing in this
+            # range — the previous power config (set during init or by an
+            # earlier valid call) is preserved.
+            return
 
         self.set_pa_config(pa_duty_cycle, hp_max, device_sel, 0x01)
         self.set_tx_params(power, PA_RAMP_800U)
