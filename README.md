@@ -10,11 +10,23 @@ Normally, Reticulum requires a separate RNode device (an ESP32 or nRF52 running 
 
 It implements:
 - **Direct SPI control** via a vendored SX126x driver on raw spidev + libgpiod 1.6
+- **Two-stage board / SBC profile selection** — pick your SBC (`platform`) and your HAT (`radio_board`) independently, and the interface resolves which `(gpiochip, line_offset)` pair each physical header pin maps to on your specific SBC
 - **CSMA/CA** with **CAD-based** carrier sense (replaces the old stale-RSSI check)
 - **RNode-compatible split-packet framing** so the full 500-byte Reticulum MTU works over the 255-byte LoRa frame limit
 - **Airtime tracking and limiting** with sliding-window accounting (no spike-after-reset artifact)
 - **Radio lockup recovery** (escalating reinit, then offline)
 - **Interoperability** with standard RNodes on the same frequency/parameters
+
+## Pin / GPIO Resolution
+
+Two-axis model so SBC and radio board can evolve independently:
+
+- **`platform`** — describes the SBC (gpiochip device, default SPI bus, and a `header_pin_to_line` table that maps *physical 40-pin-header pin numbers* to `(gpiochip, line_offset)` for this specific SBC). Bundled: `raspberry-pi`, `luckfox-pico`.
+- **`radio_board`** — describes the radio board's wiring in terms of physical 40-pin header pin numbers (portable across SBCs that share the same header layout), plus radio-electronics fields (TCXO voltage, RF switch, etc.). Bundled: `meshadv-pi-hat-v1.1`, `femtofox-integrated-v1`, `generic-sx1262-manual`.
+
+Resolution: for each pin the board profile specifies, the platform's `header_pin_to_line` is consulted to get the `(gpiochip, line_offset)` tuple handed to the vendored driver. The startup NOTICE log prints every final resolved pin pair so silent misconfigurations are easy to spot.
+
+**Escape hatch** — `radio_board = custom` bypasses the profile system: you provide `gpiochip` and `pin_*` values directly as gpiochip line offsets.
 
 ## Requirements
 
@@ -62,50 +74,80 @@ cp SX126xInterface.py vendored_sx126x.py ~/.reticulum/interfaces/
 
 Edit `~/.reticulum/config` and add an interface block. If the file doesn't exist yet, run `rnsd` once to generate it, then edit.
 
-#### MeshAdv Pi HAT v1.1 (915 MHz, default config)
+#### Profile-based config (recommended) — Pi + MeshAdv Pi HAT
 
 ```ini
-[[MeshAdv LoRa]]
-  type = SX126xInterface
-  interface_enabled = True
-  frequency = 915000000
-  bandwidth = 125000
-  spreadingfactor = 8
-  codingrate = 5
-  txpower = 22
-  # SPI — spi_cs is the spidev chip-select index (CE0=0, CE1=1), NOT a GPIO.
-  spi_bus = 0
-  spi_cs = 0
-  # GPIO pins (BCM numbering) — MeshAdv Pi HAT defaults
-  pin_irq = 16
-  pin_busy = 20
-  pin_reset = 18
-  pin_txen = 13
-  pin_rxen = 12
-  # TCXO voltage for E22 module
-  dio3_tcxo_voltage = 1.8
+[interfaces]
+
+  [[MeshAdv LoRa]]
+    type = SX126xInterface
+    interface_enabled = True
+    frequency = 915000000
+    bandwidth = 125000
+    spreadingfactor = 8
+    codingrate = 5
+    txpower = 22
+    # Profile selection (the two new keys)
+    platform    = raspberry-pi
+    radio_board = meshadv-pi-hat-v1.1
+    # TCXO voltage for E22 module (profile default is 1.8; override if needed)
+    dio3_tcxo_voltage = 1.8
 ```
 
-#### MeshAdv Pi HAT v1.1 (868 MHz variant)
+#### Profile-based config — Femtofox's integrated SX1262 hat
 
 ```ini
-[[MeshAdv LoRa 868]]
-  type = SX126xInterface
-  interface_enabled = True
-  frequency = 868000000
-  bandwidth = 125000
-  spreadingfactor = 8
-  codingrate = 5
-  txpower = 22
-  spi_bus = 0
-  spi_cs = 0
-  pin_irq = 16
-  pin_busy = 20
-  pin_reset = 18
-  pin_txen = 13
-  pin_rxen = 12
-  dio3_tcxo_voltage = 1.8
+[interfaces]
+
+  [[Femtofox LoRa]]
+    type = SX126xInterface
+    interface_enabled = True
+    frequency = 915000000
+    bandwidth = 125000
+    spreadingfactor = 8
+    codingrate = 5
+    txpower = 22
+    platform    = luckfox-pico
+    radio_board = femtofox-integrated-v1
 ```
+
+#### Escape hatch — `radio_board = custom` (hand-wired boards)
+
+When you don't have a named profile, set `radio_board = custom` and provide
+`gpiochip` + `pin_*` directly. These values are **gpiochip line offsets**,
+not physical pin numbers:
+
+```ini
+  [[My Hand-Wired Board]]
+    type = SX126xInterface
+    interface_enabled = True
+    frequency = 915000000
+    txpower = 17
+    platform    = luckfox-pico
+    radio_board = custom
+    gpiochip    = gpiochip1
+    pin_irq     = 23
+    pin_busy    = 22
+    pin_reset   = 25
+    pin_txen    = -1
+    pin_rxen    = 24
+    spi_bus     = 0
+    spi_cs      = 0
+```
+
+#### Per-key override (any profile mode)
+
+If you need to override one pin without changing the whole profile, set
+`pin_irq` etc. in the interface config block. In normal profile mode these
+are interpreted as physical 40-pin-header pin numbers (re-resolved via the
+platform's table); a WARNING is logged when an override differs from the
+profile default. In `custom` mode, they are direct gpiochip line offsets.
+
+#### Legacy mode (no `platform` / `radio_board`)
+
+If neither key is set, the interface falls back to direct BCM gpiochip line
+offsets for `pin_irq` etc. — the historical behaviour. A WARNING is logged
+at startup recommending migration to the profile system.
 
 #### With Transport enabled (router/repeater node)
 
@@ -154,6 +196,40 @@ Or create a systemd service (see below).
 
 The Waveshare HAT uses a UART-based E22 module, **not** direct SPI. It is **not compatible** with this interface. Use the SerialInterface instead, or get a direct-SPI board.
 
+## Custom Platform / Board Profiles
+
+If you have a board or SBC combination that isn't in the bundled list, you
+can add your own profiles via two optional files in
+`~/.reticulum/interfaces/`:
+
+- `sx126x_platforms` — defines new platforms
+- `sx126x_boards` — defines new boards
+
+Both are ConfigObj/INI files. Each supports `based_on = <bundled-name>` to
+inherit from a bundled profile and override individual fields.
+
+Example `sx126x_boards`:
+
+```ini
+[boards]
+
+  [[my-hand-wired-hat]]
+  based_on = generic-sx1262-manual
+  header_pin_irq = 11
+  header_pin_reset = 7
+  header_pin_txen = 13
+  header_pin_rxen = 15
+  profile_notes = My hand-wired SX1262 breakout
+```
+
+The resolver looks for these files in:
+1. `~/.reticulum/interfaces/sx126x_platforms` (or `_boards`)
+2. `<RETICULUM_HAT_MOD_DIR>/sx126x_platforms` (or `_boards`)
+3. `<cwd>/sx126x_platforms` (or `_boards`)
+
+Overlay load failures are logged as WARNINGs but do not prevent the
+interface from starting with the bundled profiles.
+
 ## Configuration Options
 
 | Option | Default | Description |
@@ -163,14 +239,20 @@ The Waveshare HAT uses a UART-based E22 module, **not** direct SPI. It is **not 
 | `spreadingfactor` | 8 | LoRa SF (5-12) |
 | `codingrate` | 5 | LoRa CR denominator (5-8 = 4/5 to 4/8) |
 | `txpower` | 22 | TX power in dBm (-9 to 22) |
+| `platform` | _(none)_ | SBC profile name (e.g. `raspberry-pi`, `luckfox-pico`). See "Pin / GPIO Resolution" above. |
+| `radio_board` | _(none)_ | HAT profile name (e.g. `meshadv-pi-hat-v1.1`, `femtofox-integrated-v1`, `custom`). |
+| `gpiochip` | (from platform) | Override the gpiochip device name. |
 | `spi_bus` | 0 | SPI bus number |
 | `spi_cs` | 0 | SPI chip-select index (spidev CE0=0, CE1=1) |
-| `pin_irq` | 16 | BCM GPIO for IRQ (DIO1) |
-| `pin_busy` | 20 | BCM GPIO for BUSY |
-| `pin_reset` | 18 | BCM GPIO for RESET |
-| `pin_txen` | 13 | BCM GPIO for TX enable |
-| `pin_rxen` | 12 | BCM GPIO for RX enable |
-| `dio3_tcxo_voltage` | 1.8 | TCXO voltage via DIO3 (0 to disable) |
+| `pin_irq` | (from board) | IRQ pin. Physical pin in profile mode; gpiochip line offset in legacy/`custom` mode. |
+| `pin_busy` | (from board) | BUSY pin. Physical pin in profile mode; gpiochip line offset in legacy/`custom` mode. |
+| `pin_reset` | (from board) | RESET pin. Physical pin in profile mode; gpiochip line offset in legacy/`custom` mode. |
+| `pin_txen` | (from board) | TXEN pin. Physical pin in profile mode; gpiochip line offset in legacy/`custom` mode. `-1` if unwired. |
+| `pin_rxen` | (from board) | RXEN pin. Physical pin in profile mode; gpiochip line offset in legacy/`custom` mode. |
+| `dio2_rf_switch` | (from board) | If true, route DIO2 as RF switch control (for E22-style modules). |
+| `dio3_tcxo_voltage` | (from board) | TCXO voltage via DIO3 (0 or false to disable). |
+| `tcxo_delay_ms` | (from board) | TCXO warm-up delay in ms. |
+| `rx_boosted_gain` | (from board) | If true, use boosted RX gain register value. |
 | `sync_word` | 0x12 | LoRa sync word (0x12=private, 0x34=public) |
 | `csma_p` | 0.1 | CSMA transmit probability (0.0-1.0) |
 | `csma_slot_ms` | 50 | CSMA slot time in milliseconds |

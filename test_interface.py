@@ -182,29 +182,32 @@ class LogEvent:
         self.level = level
         self.msg = msg
 
-class FakeRNS:
-    LOG_CRITICAL = 0
-    LOG_ERROR    = 1
-    LOG_WARNING  = 2
-    LOG_NOTICE   = 3
-    LOG_INFO     = 4
-    LOG_VERBOSE  = 5
-    LOG_DEBUG    = 6
-    LOG_EXTREME  = 7
+# FakeRNS as a real module so we can attach `vendor.configobj` for overlay loading
+fake_rns = types.ModuleType("RNS")
+fake_rns.LOG_CRITICAL = 0
+fake_rns.LOG_ERROR    = 1
+fake_rns.LOG_WARNING  = 2
+fake_rns.LOG_NOTICE   = 3
+fake_rns.LOG_INFO     = 4
+fake_rns.LOG_VERBOSE  = 5
+fake_rns.LOG_DEBUG    = 6
+fake_rns.LOG_EXTREME  = 7
+fake_rns.logs = []
+fake_rns.received = []
 
-    @staticmethod
-    def log(msg, level=3):
-        # Just record the last log line at the requested level for later
-        # inspection.
-        FakeRNS.logs.append(LogEvent(level, str(msg)))
+def _fake_rns_log(msg, level=3):
+    fake_rns.logs.append(LogEvent(level, str(msg)))
+fake_rns.log = _fake_rns_log
 
-    @staticmethod
-    def panic():
-        raise SystemExit("RNS.panic() called")
+def _fake_rns_panic():
+    raise SystemExit("RNS.panic() called")
+fake_rns.panic = _fake_rns_panic
 
-    @staticmethod
-    def trace_exception(e):
-        pass
+def _fake_rns_trace_exception(e):
+    pass
+fake_rns.trace_exception = _fake_rns_trace_exception
+
+FakeRNS = fake_rns  # backward-compat alias used elsewhere in this test file
 
 
 class FakeTransport:
@@ -213,8 +216,81 @@ class FakeTransport:
         FakeTransport.received.append((bytes(data), interface))
 
 
-FakeRNS.logs = []
 FakeTransport.received = []
+
+# Build a fake RNS.vendor.configobj shim so the resolver's overlay loading
+# works in tests without requiring the real Reticulum package.
+class FakeConfigObj:
+    """Minimal ConfigObj-compatible parser for our overlay file format.
+
+    Recognises:
+      [top-level section]
+        [[sub-section]]
+          key = value
+          [[[sub-sub-section]]]
+            key = value
+    """
+    def __init__(self, path):
+        self._data = {}
+        with open(path) as f:
+            self._parse(f)
+
+    def _parse(self, f):
+        sections = self._data
+        stack = [sections]   # stack of nested dicts
+        for raw in f:
+            line = raw.rstrip()
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("[[[") and stripped.endswith("]]]"):
+                key = stripped[3:-3].strip()
+                cur = stack[-1]
+                if "__no_section__" in cur:
+                    cur.pop("__no_section__")
+                new = {}
+                cur[key] = new
+                stack.append(new)
+            elif stripped.startswith("[[") and stripped.endswith("]]"):
+                key = stripped[2:-2].strip()
+                cur = stack[-1]
+                if "__no_section__" in cur:
+                    cur.pop("__no_section__")
+                new = {}
+                cur[key] = new
+                stack.append(new)
+            elif stripped.startswith("[") and stripped.endswith("]"):
+                key = stripped[1:-1].strip()
+                # Pop back to the top level
+                stack = [sections]
+                cur = sections
+                if key not in cur:
+                    cur[key] = {}
+                stack.append(cur[key])
+            elif "=" in stripped:
+                k, _, v = stripped.partition("=")
+                cur = stack[-1]
+                cur[k.strip()] = v.strip()
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def __iter__(self):
+        return iter(self._data)
+
+
+fake_rns_vendor = types.ModuleType("RNS.vendor")
+fake_rns_vendor_configobj = types.ModuleType("RNS.vendor.configobj")
+fake_rns_vendor_configobj.ConfigObj = FakeConfigObj
+sys.modules["RNS.vendor"] = fake_rns_vendor
+sys.modules["RNS.vendor.configobj"] = fake_rns_vendor_configobj
+fake_rns.vendor = fake_rns_vendor
 
 
 # ---- Mock the Reticulum Interfaces.Interface base class ----
@@ -505,5 +581,205 @@ inst4.radio.fail_all_spi = False
 inst4.detach()
 
 inst4.detach()
+
+# -------------------------------------------------------------------------
+# Test 5: profile-based resolution — Pi + MeshAdv HAT
+# -------------------------------------------------------------------------
+print("\n--- Test 5: profile resolution (Pi + MeshAdv HAT) ---")
+
+cfg_pi_mesh = dict(cfg)
+cfg_pi_mesh["platform"]    = "raspberry-pi"
+cfg_pi_mesh["radio_board"] = "meshadv-pi-hat-v1.1"
+# Remove the legacy key to confirm it's not needed in profile mode
+cfg_pi_mesh.pop("pin_irq", None)
+
+inst_pi = interface_class(FakeTransport(), cfg_pi_mesh)
+
+# Expected resolved (gpiochip, line) pairs for the MeshAdv Pi HAT on a Pi:
+#   header pin 36 (IRQ)  -> BCM16  -> gpiochip0 line 16
+#   header pin 38 (BUSY) -> BCM20  -> gpiochip0 line 20
+#   header pin 12 (RESET)-> BCM18  -> gpiochip0 line 18
+#   header pin 33 (TXEN) -> BCM13  -> gpiochip0 line 13
+#   header pin 32 (RXEN) -> BCM12  -> gpiochip0 line 12
+assert inst_pi.gpiochip == "gpiochip0", f"gpiochip={inst_pi.gpiochip}"
+assert inst_pi.pin_lines["irq"]  == ("gpiochip0", 16), f"irq={inst_pi.pin_lines['irq']}"
+assert inst_pi.pin_lines["busy"] == ("gpiochip0", 20), f"busy={inst_pi.pin_lines['busy']}"
+assert inst_pi.pin_lines["reset"]== ("gpiochip0", 18), f"reset={inst_pi.pin_lines['reset']}"
+assert inst_pi.pin_lines["txen"] == ("gpiochip0", 13), f"txen={inst_pi.pin_lines['txen']}"
+assert inst_pi.pin_lines["rxen"] == ("gpiochip0", 12), f"rxen={inst_pi.pin_lines['rxen']}"
+assert inst_pi.spi_bus == 0 and inst_pi.spi_cs == 0
+assert inst_pi.platform_name == "raspberry-pi"
+assert inst_pi.board_name == "meshadv-pi-hat-v1.1"
+assert inst_pi.resolution["used_profile_mode"] is True
+print(f"[OK] Pi + MeshAdv HAT: gpiochip={inst_pi.gpiochip}, "
+      f"irq={inst_pi.pin_lines['irq']}, busy={inst_pi.pin_lines['busy']}, "
+      f"reset={inst_pi.pin_lines['reset']}, txen={inst_pi.pin_lines['txen']}, "
+      f"rxen={inst_pi.pin_lines['rxen']}")
+
+# Verify the NOTICE log mentioned platform + board
+log_msgs = [e.msg for e in FakeRNS.logs if "profile resolution" in e.msg.lower()]
+assert log_msgs, "expected a NOTICE log about profile resolution"
+print("[OK] NOTICE log emitted for profile resolution")
+
+inst_pi.detach()
+
+# -------------------------------------------------------------------------
+# Test 6: profile-based resolution — Femtofox (sanity check against
+# previously hardware-verified values, no real hardware needed)
+# -------------------------------------------------------------------------
+print("\n--- Test 6: profile resolution (Femtofox) — sanity check ---")
+
+cfg_ff = dict(cfg)
+cfg_ff["platform"]    = "luckfox-pico"
+cfg_ff["radio_board"] = "femtofox-integrated-v1"
+cfg_ff.pop("pin_irq", None)
+
+inst_ff = interface_class(FakeTransport(), cfg_ff)
+
+# Expected Femtofox resolved values (the ones that were hardware-verified
+# in the prior step on actual femtofox hardware):
+#   header pin 17 (IRQ)   -> GPIO55 -> gpiochip1 line 23
+#   header pin 16 (BUSY)  -> GPIO54 -> gpiochip1 line 22
+#   header pin 13 (RESET) -> GPIO57 -> gpiochip1 line 25
+#   header pin 12 (RXEN)  -> GPIO56 -> gpiochip1 line 24
+#   header pin TXEN -> None (bridged to DIO2)
+assert inst_ff.gpiochip == "gpiochip1", f"gpiochip={inst_ff.gpiochip}"
+assert inst_ff.pin_lines["irq"]  == ("gpiochip1", 23), f"irq={inst_ff.pin_lines['irq']}"
+assert inst_ff.pin_lines["busy"] == ("gpiochip1", 22), f"busy={inst_ff.pin_lines['busy']}"
+assert inst_ff.pin_lines["reset"]== ("gpiochip1", 25), f"reset={inst_ff.pin_lines['reset']}"
+assert inst_ff.pin_lines["txen"] is None, f"txen={inst_ff.pin_lines['txen']} (should be None)"
+assert inst_ff.pin_lines["rxen"] == ("gpiochip1", 24), f"rxen={inst_ff.pin_lines['rxen']}"
+print(f"[OK] Femtofox: gpiochip={inst_ff.gpiochip}, "
+      f"irq={inst_ff.pin_lines['irq']}, busy={inst_ff.pin_lines['busy']}, "
+      f"reset={inst_ff.pin_lines['reset']}, txen={inst_ff.pin_lines['txen']}, "
+      f"rxen={inst_ff.pin_lines['rxen']}")
+
+inst_ff.detach()
+
+# -------------------------------------------------------------------------
+# Test 7: unknown platform / board names raise clear errors
+# -------------------------------------------------------------------------
+print("\n--- Test 7: unknown platform / board raise clear errors ---")
+
+cfg_bad_p = dict(cfg)
+cfg_bad_p["platform"]    = "made-up-board"
+cfg_bad_p["radio_board"] = "meshadv-pi-hat-v1.1"
+try:
+    interface_class(FakeTransport(), cfg_bad_p)
+    assert False, "expected _ProfileResolutionError for unknown platform"
+except Exception as e:
+    assert "Unknown platform" in str(e), f"unexpected error: {e}"
+    assert "made-up-board" in str(e), "error should mention the bad name"
+    assert "Known platforms" in str(e), "error should list known platforms"
+print("[OK] unknown platform raises clear error listing known platforms")
+
+cfg_bad_b = dict(cfg)
+cfg_bad_b["platform"]    = "raspberry-pi"
+cfg_bad_b["radio_board"] = "made-up-hat"
+try:
+    interface_class(FakeTransport(), cfg_bad_b)
+    assert False, "expected _ProfileResolutionError for unknown board"
+except Exception as e:
+    assert "Unknown radio_board" in str(e), f"unexpected error: {e}"
+    assert "made-up-hat" in str(e), "error should mention the bad name"
+    assert "Known boards" in str(e), "error should list known boards"
+print("[OK] unknown board raises clear error listing known boards")
+
+# -------------------------------------------------------------------------
+# Test 8: custom escape-hatch mode
+# -------------------------------------------------------------------------
+print("\n--- Test 8: radio_board = custom escape hatch ---")
+
+cfg_custom = dict(cfg)
+cfg_custom["platform"]    = "luckfox-pico"
+cfg_custom["radio_board"] = "custom"
+cfg_custom["gpiochip"]    = "gpiochip1"
+cfg_custom["pin_irq"]     = "23"
+cfg_custom["pin_busy"]    = "22"
+cfg_custom["pin_reset"]   = "25"
+cfg_custom["pin_txen"]    = "-1"
+cfg_custom["pin_rxen"]    = "24"
+cfg_custom.pop("pin_irq", None)  # pop doesn't help, re-add
+cfg_custom["pin_irq"]     = "23"
+cfg_custom["pin_busy"]    = "22"
+cfg_custom["pin_reset"]   = "25"
+cfg_custom["pin_txen"]    = "-1"
+cfg_custom["pin_rxen"]    = "24"
+
+inst_custom = interface_class(FakeTransport(), cfg_custom)
+
+assert inst_custom.board_name == "custom", f"board_name={inst_custom.board_name}"
+assert inst_custom.gpiochip == "gpiochip1", f"gpiochip={inst_custom.gpiochip}"
+assert inst_custom.pin_lines["irq"]  == ("gpiochip1", 23), f"irq={inst_custom.pin_lines['irq']}"
+assert inst_custom.pin_lines["busy"] == ("gpiochip1", 22), f"busy={inst_custom.pin_lines['busy']}"
+assert inst_custom.pin_lines["reset"]== ("gpiochip1", 25), f"reset={inst_custom.pin_lines['reset']}"
+assert inst_custom.pin_lines["txen"] is None, f"txen={inst_custom.pin_lines['txen']}"
+assert inst_custom.pin_lines["rxen"] == ("gpiochip1", 24), f"rxen={inst_custom.pin_lines['rxen']}"
+print(f"[OK] custom mode: gpiochip={inst_custom.gpiochip}, "
+      f"pin_irq={inst_custom.pin_lines['irq']}, pin_txen={inst_custom.pin_lines['txen']}")
+
+inst_custom.detach()
+
+# -------------------------------------------------------------------------
+# Test 9: per-key override wins and logs a warning
+# -------------------------------------------------------------------------
+print("\n--- Test 9: per-key override wins + WARNING ---")
+
+# Profile-mode config with an override on pin_reset (board says physical 12,
+# user forces physical 11)
+logs_before = len(FakeRNS.logs)
+cfg_override = dict(cfg)
+cfg_override["platform"]    = "raspberry-pi"
+cfg_override["radio_board"] = "meshadv-pi-hat-v1.1"
+cfg_override.pop("pin_irq", None)
+cfg_override["pin_reset"]   = "11"   # physical 11 -> BCM17 -> gpiochip0 line 17
+
+inst_ovr = interface_class(FakeTransport(), cfg_override)
+
+# The override should win: pin_reset -> physical 11 -> BCM17 -> (gpiochip0, 17)
+assert inst_ovr.pin_lines["reset"] == ("gpiochip0", 17), \
+    f"override should produce physical 11 -> BCM17, got {inst_ovr.pin_lines['reset']}"
+
+# A WARNING should have been logged about the override
+override_warnings = [
+    e for e in FakeRNS.logs[logs_before:]
+    if e.level == FakeRNS.LOG_WARNING and "override" in e.msg.lower() and "pin_reset" in e.msg
+]
+assert override_warnings, f"expected WARNING log about pin_reset override, logs={FakeRNS.logs[logs_before:]}"
+print(f"[OK] per-key override: pin_reset -> {inst_ovr.pin_lines['reset']} (WARNING logged)")
+
+inst_ovr.detach()
+
+# -------------------------------------------------------------------------
+# Test 10: based_on inheritance + overlay (test the _ProfileResolver
+# directly with a synthetic overlay file)
+# -------------------------------------------------------------------------
+print("\n--- Test 10: overlay file with based_on inheritance ---")
+
+# Write a temporary overlay file
+overlay_dir = "/tmp/opencode/sx126x-overlay-test"
+os.makedirs(overlay_dir, exist_ok=True)
+overlay_path = os.path.join(overlay_dir, "sx126x_boards")
+with open(overlay_path, "w") as f:
+    f.write("""[boards]
+
+  [[my-hat]]
+  based_on = meshadv-pi-hat-v1.1
+  header_pin_reset = 11
+  profile_notes = Inherited from MeshAdv + override reset
+""")
+# Force the resolver to search the overlay dir
+os.environ["RETICULUM_HAT_MOD_DIR"] = overlay_dir
+try:
+    resolver = interface_globals["_ProfileResolver"]()
+    assert "my-hat" in resolver.boards, f"overlay not loaded; boards keys: {list(resolver.boards.keys())}"
+    assert resolver.boards["my-hat"]["header_pin_reset"] == 11, \
+        f"overlay should override reset to 11, got {resolver.boards['my-hat']['header_pin_reset']}"
+    # Inherited fields should be present
+    assert resolver.boards["my-hat"]["header_pin_irq"] == 36, "should inherit irq from MeshAdv"
+    assert resolver.boards["my-hat"]["spi_bus"] == 0, "should inherit spi_bus from MeshAdv"
+    print("[OK] overlay file with based_on = meshadv-pi-hat-v1.1 loaded + merged correctly")
+finally:
+    os.environ.pop("RETICULUM_HAT_MOD_DIR", None)
 
 print("\n*** ALL TESTS PASSED ***")
