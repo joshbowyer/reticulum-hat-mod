@@ -1417,6 +1417,12 @@ class SX126xInterface(Interface):
             self.online = False
             return
 
+        # Diagnostic heartbeat: periodically log the current IRQ status even
+        # if no IRQ fired, so we can confirm the RX path is alive (the chip
+        # is in RX mode, IRQs are armed) and detect any silent state changes.
+        import time as _diag_time
+        _last_heartbeat = _diag_time.monotonic()
+
         while not self._stop_event.is_set():
             # ---- 1. Block briefly on the radio's IRQ edge ----
             irq = None
@@ -1442,31 +1448,81 @@ class SX126xInterface(Interface):
                 if not self._handle_spi_failure("drain_tx_queue", e):
                     return
 
+            # ---- 4. Diagnostic heartbeat (every 5s) ----
+            now = _diag_time.monotonic()
+            if now - _last_heartbeat >= 5.0:
+                _last_heartbeat = now
+                try:
+                    cur_irq = self.radio.get_irq_status()
+                    cur_status = self.radio.get_status_byte()
+                    RNS.log(
+                        str(self) + " heartbeat: status=0x{:02x} irq=0x{:04x} "
+                        "(queue size={})".format(
+                            cur_status, cur_irq,
+                            self._tx_queue.qsize() if self._tx_queue is not None else -1,
+                        ),
+                        RNS.LOG_INFO,
+                    )
+                except Exception:
+                    pass
+
         RNS.log(str(self) + " radio thread exiting", RNS.LOG_VERBOSE)
 
     def _handle_irq(self, irq):
         """Dispatch an SX126x IRQ status word to the appropriate handler."""
         vd = self.vd
+        # Log every IRQ activity at LOG_INFO so RX-side noise is visible
+        # during diagnostics (any received RF energy that fails to decode as
+        # a valid LoRa packet shows up as IRQ_HEADER_ERR / IRQ_CRC_ERR).
+        RNS.log(
+            str(self) + " IRQ status=0x{:04x} (RX_DONE={} TX_DONE={} "
+            "TIMEOUT={} CRC_ERR={} HEADER_ERR={} PREAMBLE={} SYNC={} "
+            "CAD_DONE={} CAD_DETECTED={})".format(
+                irq,
+                bool(irq & vd.IRQ_RX_DONE),
+                bool(irq & vd.IRQ_TX_DONE),
+                bool(irq & vd.IRQ_TIMEOUT),
+                bool(irq & vd.IRQ_CRC_ERR),
+                bool(irq & vd.IRQ_HEADER_ERR),
+                bool(irq & vd.IRQ_PREAMBLE_DETECTED),
+                bool(irq & vd.IRQ_SYNC_WORD_VALID),
+                bool(irq & vd.IRQ_CAD_DONE),
+                bool(irq & vd.IRQ_CAD_DETECTED),
+            ),
+            RNS.LOG_INFO,
+        )
         if irq & vd.IRQ_RX_DONE:
             self._handle_rx_done()
         if irq & vd.IRQ_TX_DONE:
             self._handle_tx_done()
         if irq & vd.IRQ_TIMEOUT:
-            RNS.log(str(self) + " radio reported timeout IRQ", RNS.LOG_DEBUG)
+            RNS.log(str(self) + " radio reported timeout IRQ", RNS.LOG_INFO)
             try:
                 self.radio.clear_irq_status(vd.IRQ_TIMEOUT)
             except Exception:
                 pass
         if irq & vd.IRQ_CRC_ERR:
-            RNS.log(str(self) + " CRC error on received frame", RNS.LOG_DEBUG)
+            RNS.log(str(self) + " CRC error on received frame", RNS.LOG_INFO)
             try:
                 self.radio.clear_irq_status(vd.IRQ_CRC_ERR)
             except Exception:
                 pass
         if irq & vd.IRQ_HEADER_ERR:
-            RNS.log(str(self) + " header error on received frame", RNS.LOG_DEBUG)
+            RNS.log(str(self) + " header error on received frame (likely sync-word/header-mode mismatch)", RNS.LOG_INFO)
             try:
                 self.radio.clear_irq_status(vd.IRQ_HEADER_ERR)
+            except Exception:
+                pass
+        if irq & vd.IRQ_PREAMBLE_DETECTED:
+            RNS.log(str(self) + " preamble detected (RF energy is arriving)", RNS.LOG_INFO)
+            try:
+                self.radio.clear_irq_status(vd.IRQ_PREAMBLE_DETECTED)
+            except Exception:
+                pass
+        if irq & vd.IRQ_SYNC_WORD_VALID:
+            RNS.log(str(self) + " sync word valid (LoRa preamble+sync matched)", RNS.LOG_INFO)
+            try:
+                self.radio.clear_irq_status(vd.IRQ_SYNC_WORD_VALID)
             except Exception:
                 pass
         # CAD IRQs are handled inline inside _channel_is_clear(); clear them
@@ -1507,6 +1563,19 @@ class SX126xInterface(Interface):
                     + f"{rssi_dbm:.1f}" + ", SNR: " + f"{snr_db:.1f}"
                     + ")", RNS.LOG_DEBUG)
 
+            # Permanent diagnostic: log the raw first ~16 bytes of the RX
+            # buffer at DEBUG level. Post the off-by-one + payloadLength
+            # fix, real Reticulum packets should have sizes in the 150-180
+            # byte range for announces, NOT always 255. If we see 255
+            # again the chip is still mis-reporting payload length.
+            preview = frame_data[:16]
+            RNS.log(
+                str(self) + " rx-preview len=" + str(len(frame_data))
+                + " head=" + preview.hex() + " rssi=" + f"{rssi_dbm:.1f}"
+                + " snr=" + f"{snr_db:.1f}",
+                RNS.LOG_DEBUG,
+            )
+
             packet = self._reassemble(frame_data)
             if packet is not None:
                 self.process_incoming(packet)
@@ -1542,6 +1611,22 @@ class SX126xInterface(Interface):
         # module's RX path is enabled. No-op when the board doesn't define
         # them.
         self.radio.set_rx_enable(True)
+        # Explicitly restore the LoRa packet params to the maximum payload
+        # length (255) before issuing SetRx. The previous SetPacketParams
+        # call (from the most recent _transmit_frame_blocking) would have
+        # left payloadLength at len(frame) — which is fine for the receiver
+        # to accept packets up to that size, but it's much more useful to
+        # have the RX path accept the full 255-byte maximum rather than
+        # whatever length the most recent TX happened to be. Explicit is
+        # also defensive: if RX mode is entered before any TX (e.g. on
+        # initial boot), we don't rely on the chip's default being 255.
+        self.radio.set_lora_packet(
+            vd.HEADER_EXPLICIT,
+            8,
+            SX126xInterface.LORA_MAX_PAYLOAD,
+            True,
+            False,
+        )
         self.radio.set_standby(vd.STANDBY_RC)
         self.radio.set_dio_irq_params(irq_mask, dio1_mask=irq_mask)
         self.radio.clear_irq_status(vd.IRQ_ALL)
@@ -1733,11 +1818,20 @@ class SX126xInterface(Interface):
             # Femtofox-integrated profile does), so this is safe for both
             # "TXEN bridged to DIO2" and "TXEN on a separate GPIO" boards.
             self.radio.set_tx_enable(True)
-            # Make sure the chip knows the current max payload length.
+            # Set the LoRa packet params with the EXACT payload length
+            # we are about to transmit — per SX126x datasheet §13.4.6,
+            # payloadLength is the number of bytes the modem transmits, NOT
+            # a maximum. Using LORA_MAX_PAYLOAD here would cause the chip
+            # to transmit len(frame) real bytes followed by (255-len(frame))
+            # bytes of stale TX-buffer garbage, with the LoRa header
+            # declaring length 255 and the CRC computed over all 255 bytes
+            # — making the resulting RX_DONE clean (LoRa-level decode
+            # succeeds) but the payload = real-packet-plus-garbage, which
+            # Reticulum's higher-layer validation silently rejects.
             self.radio.set_lora_packet(
                 vd.HEADER_EXPLICIT,
                 8,
-                SX126xInterface.LORA_MAX_PAYLOAD,
+                len(frame),
                 True,
                 False,
             )
