@@ -511,6 +511,14 @@ class SX126xRadio:
             # Calibrate again so the chip knows the XOSC is now warm.
             self.set_standby(STANDBY_RC)
             self.calibrate(0xFF)
+            # XOSC_START_ERR latches in the device-errors register on every
+            # cold start on TCXO boards (datasheet §13.5.13). Clear it so
+            # future diagnostics aren't confused by a stale latched error
+            # from this init.
+            try:
+                self.clear_device_errors()
+            except Exception:
+                pass
 
         return True
 
@@ -595,14 +603,30 @@ class SX126xRadio:
             self._spi.xfer2(list(buf))
 
     def _spi_read(self, opcode, address=b"", n_data=1):
-        """Issue a read SX126x command: [opcode, address..., 0x00 * n_data].
-        Returns the n_data bytes that come back *after* the optional address
-        bytes (LoRaRF-style feedback offset = n_address + 1 for status byte
-        + 0 for no-NACK SPI on this chip)."""
+        """Issue a read SX126x command: [opcode, address..., 0x00 * (n_data+1)].
+        The SX126x SPI read protocol requires ONE extra dummy byte beyond the
+        address and data — the chip clocks out one STATUS byte per MISO byte
+        until the data phase starts. The wire layout is:
+
+            MOSI:  [opcode, addr0..addrN, 0x00, 0x00..(n_data-1)]
+            MISO:  [STATUS, addr0_echo..addrN_echo, 0x00, DATA[0..n_data-1]]
+
+        We send (n_data + 1) trailing zero bytes so that the chip clocks out
+        (n_data + 1) MISO bytes in the data phase, and slice the last
+        n_data bytes from the feedback. Slice offset is therefore
+        n_addr + 2 (skip opcode status, skip address echoes, then data).
+
+        The previous version sent only n_data trailing zeros and sliced from
+        n_addr + 1, which made every read return a value shifted by one byte
+        and corrupted read-modify-write sequences (REG_TX_MODULATION,
+        REG_TX_CLAMP_CONFIG, REG_IQ_POLARITY_SETUP) — the chip was
+        repeatedly written back with the wrong byte, eventually leaving
+        the TX path in a state the chip would refuse to execute (status 0x2a,
+        "command execution failed")."""
         if self._wait_busy(self.busy_timeout_ms) is False:
             raise SX126xTimeout("BUSY pin stayed high before opcode 0x{:02x}".format(opcode))
         n_addr = len(address)
-        buf = bytes([opcode]) + bytes(address) + (b"\x00" * n_data)
+        buf = bytes([opcode]) + bytes(address) + (b"\x00" * (n_data + 1))
         if self._line_cs is not None:
             self._line_cs.set_value(self.LOW)
             try:
@@ -611,9 +635,12 @@ class SX126xRadio:
                 self._line_cs.set_value(self.HIGH)
         else:
             feedback = self._spi.xfer2(list(buf))
-        # feedback[0] is the status byte; feedback[1..n_addr] echo address;
-        # feedback[n_addr+1 ..] is the requested data.
-        return bytes(feedback[n_addr + 1:])
+        # Layout of feedback:
+        #   feedback[0]            = STATUS byte (auto-clocked on every read)
+        #   feedback[1..n_addr]    = echoed address bytes
+        #   feedback[n_addr+1]     = 0x00 (the extra "status NOP" we clocked out)
+        #   feedback[n_addr+2:]    = real DATA bytes
+        return bytes(feedback[n_addr + 2:])
 
     # ------------------------------------------------------------------
     # Operational mode commands (§13.1 of SX126x datasheet)
@@ -859,7 +886,10 @@ class SX126xRadio:
         return self._spi_read(CMD_GET_RSSI_INST, n_data=1)[0]
 
     def get_device_errors(self):
-        return self._spi_read(CMD_GET_DEVICE_ERRORS, n_data=1)[0]
+        """Return the 16-bit device-errors register (OpErrors).
+        Bit assignments per SX126x datasheet §13.5.13."""
+        raw = self._spi_read(CMD_GET_DEVICE_ERRORS, n_data=2)
+        return (raw[0] << 8) | raw[1]
 
     def clear_device_errors(self):
         self._spi_write(CMD_CLEAR_DEVICE_ERRORS, bytes([0, 0]))
@@ -932,6 +962,20 @@ class SX126xRadio:
         deadline = time.monotonic() + max(timeout_s, 0.0)
         with self._irq_lock:
             if self._line_irq is not None and self._irq_requested:
+                # Drain any backlog events that accumulated on the IRQ line
+                # since the last call (e.g. from earlier SetStandby calls
+                # that re-triggered DIO1, or from a previous wait_irq_done
+                # that returned but didn't fully drain). Without this, a
+                # stale FIFO entry can fire event_wait() immediately with
+                # an IRQ status from a previous operation.
+                while True:
+                    has_event = self._line_irq.event_wait(0, 0)
+                    if not has_event:
+                        break
+                    try:
+                        self._line_irq.event_read()
+                    except Exception:
+                        pass
                 # Edge-wait path — blocks in the kernel until the line
                 # fires (libgpiod v1.x: event_wait(sec, nsec)).
                 remaining = deadline - time.monotonic()
@@ -1013,15 +1057,28 @@ class SX126xRadio:
         elif tx_power_dbm >= 10 and version == TX_POWER_SX1268:
             pa_duty_cycle, hp_max, power = 0x00, 0x03, 0x0F
         else:
-            # Below the lowest band (or unsupported combination). SX1262
-            # datasheet doesn't list a valid SetTxParams + SetPaConfig pair
-            # for these values — calling it with an inconsistent state
-            # (e.g. paDutyCycle=0 with a non-zero power register) causes the
-            # chip to reject the next SetTx with "command execution failed"
-            # (status 0x2a). Match LoRaRF-Python and do nothing in this
-            # range — the previous power config (set during init or by an
-            # earlier valid call) is preserved.
-            return
+            # Below the lowest supported value (SX1262: 14 dBm,
+            # SX1261/SX1268: 10 dBm). SX126x datasheet doesn't list a valid
+            # SetTxParams + SetPaConfig pair for these values — calling it
+            # with an inconsistent state (e.g. paDutyCycle=0 with a non-zero
+            # power register) causes the chip to reject the next SetTx with
+            # "command execution failed" (status 0x2a). Clamp UP to the
+            # lowest supported value rather than silently doing nothing —
+            # silently doing nothing would mean the chip retains its
+            # post-reset default (22 dBm) and the user has no idea their
+            # request was ignored.
+            import warnings as _w
+            _w.warn(
+                "SX126x set_tx_power({} dBm) below minimum for this chip "
+                "variant; clamping to 14 dBm.".format(tx_power_dbm),
+                stacklevel=2,
+            )
+            # Re-run the resolution with the clamped value.
+            if version == TX_POWER_SX1262:
+                tx_power_dbm = 14
+            else:
+                tx_power_dbm = 10
+            return self.set_tx_power(tx_power_dbm, version=version)
 
         self.set_pa_config(pa_duty_cycle, hp_max, device_sel, 0x01)
         self.set_tx_params(power, PA_RAMP_800U)

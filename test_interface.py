@@ -90,6 +90,24 @@ class FakeSX126xRadio:
     def request_irq_edge(self, edge): self._maybe_fail()
     def release_irq_edge(self): pass
 
+    def set_tx_enable(self, on=True): self._maybe_fail()
+    def set_rx_enable(self, on=True): self._maybe_fail()
+    def restore_tx_rx_pins(self): pass
+
+    def set_pa_config(self, *a, **kw): self._maybe_fail()
+    def set_tx_params(self, *a, **kw): self._maybe_fail()
+    def clear_device_errors(self): self._maybe_fail()
+    def read_register(self, address, n_bytes=1):
+        # Default: return zeros (matches the chip's reset values for
+        # registers we care about). The real driver may read-modify-write
+        # these — having them all zero is a safe default that lets those
+        # operations complete.
+        self._maybe_fail()
+        return bytes(n_bytes)
+    def write_register(self, address, data):
+        self._maybe_fail()
+        return None
+
     def set_standby(self, mode):
         self._mode = "STDBY"
         self.in_rx = False

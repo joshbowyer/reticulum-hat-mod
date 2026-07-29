@@ -1208,6 +1208,14 @@ class SX126xInterface(Interface):
                 self.radio.set_dio3_as_tcxo_ctrl(voltage, delay)
                 self.radio.set_standby(vd.STANDBY_RC)
                 self.radio.calibrate(0xFF)
+                # XOSC_START_ERR latches in the device-errors register on
+                # every cold start on TCXO boards (datasheet §13.5.13).
+                # Clear it so future diagnostics aren't confused by a stale
+                # latched error from this reinit.
+                try:
+                    self.radio.clear_device_errors()
+                except Exception:
+                    pass
 
             self.radio.set_dio2_as_rf_switch_ctrl(self.dio2_rf_switch)
             self.radio.set_regulator_mode(vd.REGULATOR_DC_DC)
@@ -1530,6 +1538,10 @@ class SX126xInterface(Interface):
         for RX events. Safe to call repeatedly."""
         vd = self.vd
         irq_mask = vd.IRQ_RX_DONE | vd.IRQ_TIMEOUT | vd.IRQ_CRC_ERR | vd.IRQ_HEADER_ERR
+        # Drive the board's external RXEN/TXEN GPIOs (if any) so the E22
+        # module's RX path is enabled. No-op when the board doesn't define
+        # them.
+        self.radio.set_rx_enable(True)
         self.radio.set_standby(vd.STANDBY_RC)
         self.radio.set_dio_irq_params(irq_mask, dio1_mask=irq_mask)
         self.radio.clear_irq_status(vd.IRQ_ALL)
@@ -1701,12 +1713,26 @@ class SX126xInterface(Interface):
         toa = self._calculate_toa(len(frame))
         timeout_s = max(min(toa * 1.5 + 1.0, 15.0), 1.0)
 
-        # Chip-internal TX timeout, encoded in 15.625us units. 1.2x TOA
-        # so the chip times out just after we would.
-        chip_timeout_units = int(toa * 64000.0 * 1.2) & 0x00FFFFFF
+        # Chip-internal TX timeout: 0 = "no chip-side timeout" (TX_SINGLE
+        # convention from LoRaRF-Python). The chip will only signal TX_DONE
+        # or, on a stuck-state chip, never signal at all (caught by the
+        # host-side wait_irq_done above). We previously set a chip-side
+        # timeout of 1.2x TOA here, but on some SX1262 firmware states a
+        # rejected SetTx (status 0x2a) immediately fires IRQ_TIMEOUT
+        # (~1ms), which is indistinguishable from a real TX timeout and
+        # confuses the host. Letting the chip use TX_SINGLE and trusting
+        # the host-side wait_irq_done is cleaner.
+        chip_timeout_units = 0x000000
 
         try:
             self.radio.set_standby(vd.STANDBY_RC)
+            # Drive the board's external TXEN/RXEN GPIOs (if any) so the
+            # E22 module's PA path is enabled for TX. The vendored driver's
+            # set_tx_enable() is a no-op when self._line_txen is None (i.e.
+            # when the board profile set header_pin_txen = -1, as the
+            # Femtofox-integrated profile does), so this is safe for both
+            # "TXEN bridged to DIO2" and "TXEN on a separate GPIO" boards.
+            self.radio.set_tx_enable(True)
             # Make sure the chip knows the current max payload length.
             self.radio.set_lora_packet(
                 vd.HEADER_EXPLICIT,
@@ -1728,6 +1754,9 @@ class SX126xInterface(Interface):
                 self.radio.clear_irq_status(vd.IRQ_TX_DONE | vd.IRQ_TIMEOUT)
             except Exception:
                 pass
+            # Restore TXEN/RXEN to their pre-TX state. No-op when the
+            # board doesn't define them.
+            self.radio.restore_tx_rx_pins()
 
             if irq is None:
                 RNS.log(str(self) + " TX wait timed out", RNS.LOG_WARNING)
