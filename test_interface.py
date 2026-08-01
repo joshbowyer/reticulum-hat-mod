@@ -17,8 +17,8 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-INTERFACE_PATH = "/home/josh/reticulum-stack/dev/reticulum-hat-mod/SX126xInterface.py"
-VENDORED_PATH  = "/home/josh/reticulum-stack/dev/reticulum-hat-mod/vendored_sx126x.py"
+INTERFACE_PATH = os.path.join(HERE, "SX126xInterface.py")
+VENDORED_PATH  = os.path.join(HERE, "vendored_sx126x.py")
 
 # ---- Build a fake "vendored_sx126x" with a stub SX126xRadio class ----
 
