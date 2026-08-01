@@ -120,6 +120,35 @@ import importlib.util
 from collections import deque
 
 
+def _rnode_preamble_symbols(sf, bandwidth, cr):
+    """Replicate mainline RNode_Firmware's dynamic preamble-length auto-tune
+    (updateBitrate() in Utilities.h) so this driver's default preamble
+    matches what a stock RNode transmits/expects for a given SF/BW/CR,
+    instead of an arbitrary fixed value.
+
+    RNode targets ~24ms of preamble airtime (less on fast links), with a
+    hard floor of 18 symbols. See the long comment at the preamble_length
+    config-parsing site for the full rationale.
+    """
+    try:
+        symbol_time_ms = (2.0 ** sf / bandwidth) * 1000.0
+        bitrate = sf * ((4.0 / cr) / (2.0 ** sf / (bandwidth / 1000.0))) * 1000.0
+
+        target_ms = 24.0  # LORA_PREAMBLE_TARGET_MS
+        if bitrate > 30000:  # LORA_FAST_THRESHOLD_BPS
+            target_ms -= 18.0  # LORA_PREAMBLE_FAST_DELTA
+
+        target_symbols = target_ms / symbol_time_ms
+        if target_symbols < 18:  # LORA_PREAMBLE_SYMBOLS_MIN
+            target_symbols = 18
+        else:
+            target_symbols = math.ceil(target_symbols)
+
+        return int(target_symbols)
+    except Exception:
+        return 18  # safe RNode-compatible floor if anything above misbehaves
+
+
 def _load_vendored_driver():
     """Locate and load vendored_sx126x.py alongside this interface module.
 
@@ -991,20 +1020,34 @@ class SX126xInterface(Interface):
         else:
             sync_word = 0x12
 
-        # Preamble length (LoRa preamble symbol count). Default 8 to match
-        # RNode / mainline. Some other Reticulum-compatible LoRa firmwares
-        # (e.g. thatSFguy/reticulum-lora-repeater) use 16 — both sides MUST
-        # match, otherwise the preamble correlator never locks and RX fails
-        # silently with no errors. Tolerated like sync_word: invalid or
-        # missing value falls back to 8 with no error.
+        # Preamble length (LoRa preamble symbol count).
+        #
+        # IMPORTANT: mainline RNode_Firmware does NOT use a fixed preamble of
+        # 8 symbols (a previous version of this comment incorrectly assumed
+        # that). RNode dynamically computes its preamble length in
+        # updateBitrate() (Utilities.h) to target ~24ms of preamble airtime
+        # (LORA_PREAMBLE_TARGET_MS=24, reduced by LORA_PREAMBLE_FAST_DELTA=18
+        # when bitrate > LORA_FAST_THRESHOLD_BPS=30000bps), with a hard floor
+        # of LORA_PREAMBLE_SYMBOLS_MIN=18 symbols. At SF7/BW125000/CR5 (the
+        # common default) this computes to 24 symbols, NOT 8. An 8-symbol
+        # preamble is too short for a stock RNode receiver's correlator to
+        # reliably lock onto, causing silent one-way RX failure in the
+        # RNode-receives-from-us direction (TX LED lights, frame radiates,
+        # but the peer's demodulator never detects it) while still allowing
+        # this driver to receive RNode's own (longer) preambles fine — an
+        # asymmetric failure that looks like a hardware fault but isn't.
+        #
+        # We replicate RNode's exact auto-tune formula by default so this
+        # driver interoperates with stock RNode nodes out of the box. An
+        # explicit `preamble_length` config value always overrides this.
         if "preamble_length" in c:
             try:
                 _pl = int(c["preamble_length"])
-                preamble_length = _pl if _pl > 0 else 8
+                preamble_length = _pl if _pl > 0 else _rnode_preamble_symbols(sf, bandwidth, cr)
             except (ValueError, TypeError):
-                preamble_length = 8
+                preamble_length = _rnode_preamble_symbols(sf, bandwidth, cr)
         else:
-            preamble_length = 8
+            preamble_length = _rnode_preamble_symbols(sf, bandwidth, cr)
 
         # CSMA/CA parameters
         self.csma_p           = float(c["csma_p"])         if "csma_p"         in c else 0.1
@@ -1569,6 +1612,17 @@ class SX126xInterface(Interface):
                 # IRQ_RX_DONE fired but nothing in the buffer — probably a
                 # header/CRC error swallowed the frame. Clear IRQs and exit.
                 try:
+                    status_byte = self.radio.get_status_byte()
+                    irq_now = self.radio.get_irq_status()
+                    RNS.log(
+                        str(self) + " payload_len<=0 on RX_DONE: "
+                        "status=0x{:02x}".format(status_byte)
+                        + " irq_now=0x{:04x}".format(irq_now),
+                        RNS.LOG_DEBUG,
+                    )
+                except Exception:
+                    pass
+                try:
                     self.radio.clear_irq_status(vd.IRQ_RX_DONE | vd.IRQ_CRC_ERR | vd.IRQ_HEADER_ERR)
                 except Exception:
                     pass
@@ -1589,11 +1643,9 @@ class SX126xInterface(Interface):
                     + f"{rssi_dbm:.1f}" + ", SNR: " + f"{snr_db:.1f}"
                     + ")", RNS.LOG_DEBUG)
 
-            # Permanent diagnostic: log the raw first ~16 bytes of the RX
-            # buffer at DEBUG level. Post the off-by-one + payloadLength
-            # fix, real Reticulum packets should have sizes in the 150-180
-            # byte range for announces, NOT always 255. If we see 255
-            # again the chip is still mis-reporting payload length.
+            # Log the raw first ~16 bytes of the RX buffer at DEBUG level.
+            # Useful for confirming frame/destination-hash alignment when
+            # diagnosing interop with other Reticulum-compatible firmwares.
             preview = frame_data[:16]
             RNS.log(
                 str(self) + " rx-preview len=" + str(len(frame_data))
