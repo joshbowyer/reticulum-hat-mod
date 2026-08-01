@@ -991,6 +991,21 @@ class SX126xInterface(Interface):
         else:
             sync_word = 0x12
 
+        # Preamble length (LoRa preamble symbol count). Default 8 to match
+        # RNode / mainline. Some other Reticulum-compatible LoRa firmwares
+        # (e.g. thatSFguy/reticulum-lora-repeater) use 16 — both sides MUST
+        # match, otherwise the preamble correlator never locks and RX fails
+        # silently with no errors. Tolerated like sync_word: invalid or
+        # missing value falls back to 8 with no error.
+        if "preamble_length" in c:
+            try:
+                _pl = int(c["preamble_length"])
+                preamble_length = _pl if _pl > 0 else 8
+            except (ValueError, TypeError):
+                preamble_length = 8
+        else:
+            preamble_length = 8
+
         # CSMA/CA parameters
         self.csma_p           = float(c["csma_p"])         if "csma_p"         in c else 0.1
         self.csma_slot_ms     = float(c["csma_slot_ms"])   if "csma_slot_ms"   in c else 50.0
@@ -1017,6 +1032,7 @@ class SX126xInterface(Interface):
         self.sf        = sf
         self.cr        = cr
         self.sync_word = sync_word
+        self.preamble_length = preamble_length
 
         self.bitrate     = 0
         self.r_stat_rssi = None
@@ -1151,11 +1167,13 @@ class SX126xInterface(Interface):
         ldro = self._should_use_ldro()
         self.radio.set_lora_modulation(self.sf, self.bandwidth, self.cr, ldro)
 
-        # Packet params: explicit header, 8-symbol preamble, max 255-byte payload,
-        # CRC on, no IQ invert.
+        # Packet params: explicit header, configurable preamble length
+        # (default 8 symbols, override via `preamble_length` config key to
+        # interoperate with firmwares that use a non-default preamble such
+        # as 16), max 255-byte payload, CRC on, no IQ invert.
         self.radio.set_lora_packet(
             vd.HEADER_EXPLICIT,
-            8,
+            self.preamble_length,
             SX126xInterface.LORA_MAX_PAYLOAD,
             True,   # CRC enabled
             False,  # IQ not inverted
@@ -1231,7 +1249,7 @@ class SX126xInterface(Interface):
 
             self.radio.set_lora_packet(
                 vd.HEADER_EXPLICIT,
-                8,
+                self.preamble_length,
                 SX126xInterface.LORA_MAX_PAYLOAD,
                 True,
                 False,
@@ -1282,7 +1300,12 @@ class SX126xInterface(Interface):
         bw = self.bandwidth
         sf = self.sf
         cr = self.cr
-        preamble_len = 8
+        # Use the configured preamble length so airtime budgets are accurate
+        # when interoperating with firmwares that use a non-default preamble
+        # (e.g. 16). A mismatch here would make the CSMA / airtime-limiter
+        # under-count real on-air time and silently exceed the configured
+        # duty cycle.
+        preamble_len = self.preamble_length
         has_crc = True
         explicit_header = True
         ldro = self._should_use_ldro()
@@ -1430,6 +1453,7 @@ class SX126xInterface(Interface):
                 irq = self.radio.wait_irq_done(0.1)
                 self._consecutive_spi_failures = 0
             except Exception as e:
+                RNS.log(str(self) + " wait_irq_done exception: " + str(e), RNS.LOG_WARNING)
                 if not self._handle_spi_failure("wait_irq_done", e):
                     return  # interface marked offline
 
@@ -1463,8 +1487,10 @@ class SX126xInterface(Interface):
                         ),
                         RNS.LOG_INFO,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    RNS.log(str(self) + " heartbeat SPI failure: " + str(e), RNS.LOG_WARNING)
+                    if not self._handle_spi_failure("heartbeat", e):
+                        return
 
         RNS.log(str(self) + " radio thread exiting", RNS.LOG_VERBOSE)
 
@@ -1622,7 +1648,7 @@ class SX126xInterface(Interface):
         # initial boot), we don't rely on the chip's default being 255.
         self.radio.set_lora_packet(
             vd.HEADER_EXPLICIT,
-            8,
+            self.preamble_length,
             SX126xInterface.LORA_MAX_PAYLOAD,
             True,
             False,
@@ -1830,7 +1856,7 @@ class SX126xInterface(Interface):
             # Reticulum's higher-layer validation silently rejects.
             self.radio.set_lora_packet(
                 vd.HEADER_EXPLICIT,
-                8,
+                self.preamble_length,
                 len(frame),
                 True,
                 False,

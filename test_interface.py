@@ -54,6 +54,9 @@ class FakeSX126xRadio:
         self.fail_next = False
         # fail_all_spi: when True, every SPI/op raises (until cleared).
         self.fail_all_spi = False
+        # Record of all set_lora_packet(...) calls (used to verify that
+        # the configured preamble_length actually flows through to the radio).
+        self.set_lora_packet_calls = []
 
     def open(self):
         self.opened = True
@@ -80,7 +83,11 @@ class FakeSX126xRadio:
     def set_tx_power(self, *a, **kw): self._maybe_fail()
     def set_rx_gain(self, g): self._maybe_fail()
     def set_lora_modulation(self, *a): self._maybe_fail()
-    def set_lora_packet(self, *a): self._maybe_fail()
+    def set_lora_packet(self, *a):
+        # Record every call so tests can inspect the preamble_length (and
+        # other params) actually handed to the radio.
+        self.set_lora_packet_calls.append(a)
+        self._maybe_fail()
     def set_sync_word(self, w): self._maybe_fail()
     def set_cad_params(self, *a, **kw): self._maybe_fail()
     def set_packet_type(self, t): self._maybe_fail()
@@ -802,5 +809,71 @@ try:
     print("[OK] overlay file with based_on = meshadv-pi-hat-v1.1 loaded + merged correctly")
 finally:
     os.environ.pop("RETICULUM_HAT_MOD_DIR", None)
+
+# -------------------------------------------------------------------------
+# Test 11: preamble_length config key (interoperability with non-RNode
+# LoRa firmwares such as thatSFguy/reticulum-lora-repeater which use
+# a 16-symbol preamble). Default must be 8; override must flow through
+# to set_lora_packet and _calculate_toa.
+# -------------------------------------------------------------------------
+print("\n--- Test 11: preamble_length config key ---")
+
+# (a) default: no preamble_length in config -> 8
+cfg_pl_default = dict(cfg)
+inst_pl_default = interface_class(FakeTransport(), cfg_pl_default)
+assert inst_pl_default.preamble_length == 8, \
+    f"default preamble_length should be 8, got {inst_pl_default.preamble_length}"
+print("[OK] default preamble_length == 8")
+
+# (b) override: preamble_length = 16 -> 16, and set_lora_packet sees it
+cfg_pl_16 = dict(cfg)
+cfg_pl_16["preamble_length"] = "16"
+inst_pl_16 = interface_class(FakeTransport(), cfg_pl_16)
+assert inst_pl_16.preamble_length == 16, \
+    f"preamble_length=16 should round-trip to 16, got {inst_pl_16.preamble_length}"
+
+# Every set_lora_packet(...) call recorded by the mock so far must have
+# used 16 as the preamble_length (positional arg index 1).
+assert inst_pl_16.radio.set_lora_packet_calls, \
+    "expected at least one set_lora_packet call on the mock radio"
+for call in inst_pl_16.radio.set_lora_packet_calls:
+    preamble_arg = call[1]
+    assert preamble_arg == 16, \
+        f"every set_lora_packet call must use preamble_length=16, saw {preamble_arg} in args={call}"
+print(f"[OK] preamble_length=16 flows through to all {len(inst_pl_16.radio.set_lora_packet_calls)} set_lora_packet calls")
+
+# (c) invalid value (non-numeric) must fall back to 8, no error raised
+cfg_pl_bad = dict(cfg)
+cfg_pl_bad["preamble_length"] = "not-a-number"
+inst_pl_bad = interface_class(FakeTransport(), cfg_pl_bad)
+assert inst_pl_bad.preamble_length == 8, \
+    f"invalid preamble_length should default to 8, got {inst_pl_bad.preamble_length}"
+print("[OK] invalid preamble_length silently falls back to 8")
+
+# (d) invalid value (zero / negative) must fall back to 8
+cfg_pl_zero = dict(cfg)
+cfg_pl_zero["preamble_length"] = "0"
+inst_pl_zero = interface_class(FakeTransport(), cfg_pl_zero)
+assert inst_pl_zero.preamble_length == 8, \
+    f"preamble_length=0 should default to 8, got {inst_pl_zero.preamble_length}"
+print("[OK] preamble_length=0 silently falls back to 8")
+
+# (e) _calculate_toa must use the configured preamble_length
+#      8 symbols at SF8/BW125k: t_preamble = (8 + 4.25) * t_sym
+#     16 symbols at SF8/BW125k: t_preamble = (16 + 4.25) * t_sym
+toa_8  = inst_pl_default._calculate_toa(50)
+toa_16 = inst_pl_16._calculate_toa(50)
+assert toa_16 > toa_8, \
+    f"toa with preamble=16 ({toa_16}) should be greater than toa with preamble=8 ({toa_8})"
+expected_diff = (16 - 8) * ((2 ** 8) / 125000)
+assert abs((toa_16 - toa_8) - expected_diff) < 1e-9, \
+    f"toa delta should be 8*t_sym = {expected_diff}, got {toa_16 - toa_8}"
+print(f"[OK] _calculate_toa honours preamble_length: toa_8={toa_8*1000:.2f}ms, "
+      f"toa_16={toa_16*1000:.2f}ms, delta={expected_diff*1000:.2f}ms")
+
+inst_pl_default.detach()
+inst_pl_16.detach()
+inst_pl_bad.detach()
+inst_pl_zero.detach()
 
 print("\n*** ALL TESTS PASSED ***")
