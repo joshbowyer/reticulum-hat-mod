@@ -4,6 +4,8 @@ A custom Reticulum interface module that drives SX1262/SX1268 LoRa chips **direc
 
 Designed for the **MeshAdv Pi HAT v1.1** but works with any SPI-connected SX126x board with configurable pin mapping.
 
+Updated to work with the Femtofox and any of the sx1262 boards.
+
 ## What This Does
 
 Normally, Reticulum requires a separate RNode device (an ESP32 or nRF52 running RNode firmware) connected via USB serial. This interface eliminates that second device by talking directly to the SX1262 LoRa chip over the Pi's SPI bus.
