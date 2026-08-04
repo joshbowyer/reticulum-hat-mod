@@ -2,7 +2,8 @@
 # vendored_sx126x.py                                                         #
 #                                                                            #
 # Minimal, single-purpose SX1261/SX1262/SX1268 (and LLCC68) driver on raw    #
-# spidev + libgpiod 1.6.x.                                                  #
+# spidev + libgpiod 2.2.x (request-based Python API; migrated from the      #
+# old 1.6.x Chip/Line API - see the GPIO helper methods for details).       #
 #                                                                            #
 # Replaces LoRaRF-Python (which busy-spins on wait() and burns 100% CPU).   #
 # All SX126x command opcodes and parameter byte sequences were extracted     #
@@ -41,9 +42,15 @@ except ImportError:
     spidev = None
 
 try:
-    import gpiod  # provided by Debian/Ubuntu package python3-libgpiod
+    import gpiod  # provided by Debian/Ubuntu package python3-libgpiod (v2.x)
+    from gpiod.line import Direction as _GpiodDirection
+    from gpiod.line import Value as _GpiodValue
+    from gpiod.line import Edge as _GpiodEdge
 except ImportError:
     gpiod = None
+    _GpiodDirection = None
+    _GpiodValue = None
+    _GpiodEdge = None
 
 
 # ---------------------------------------------------------------------------
@@ -298,24 +305,37 @@ _BAND_CALIBRATION = [
 # ---------------------------------------------------------------------------
 
 class SX126xRadio:
-    """Minimal SX1261/SX1262/SX1268 / LLCC68 driver on spidev + libgpiod 1.6.x.
+    """Minimal SX1261/SX1262/SX1268 / LLCC68 driver on spidev + libgpiod 2.2.x.
 
     All public methods map 1:1 to an SX126x command (or to a small composition
     of commands, clearly named). No threading, no queues, no callbacks — the
     caller drives the chip and is responsible for the high-level TX/RX state
     machine. This class owns:
 
-      * /dev/spidevX.Y           — opened with mode 0 (CPOL=0, CPHA=0)
-      * libgpiod Chip + Lines    — for RESET, BUSY, IRQ (edge), TXEN, RXEN
-      * the SX126x chip state    — kept consistent with SX126x datasheet rev 1.2
+      * /dev/spidevX.Y                — opened with mode 0 (CPOL=0, CPHA=0)
+      * libgpiod v2 LineRequest handles — one independent request per pin
+        (RESET, BUSY, IRQ (edge), TXEN, RXEN, CS) — for RESET, BUSY, IRQ
+        (edge), TXEN, RXEN
+      * the SX126x chip state         — kept consistent with SX126x datasheet
+        rev 1.2
 
     The IRQ wait (wait_irq_done) blocks on a libgpiod edge event, *not* a CPU
     spin, which is the whole reason this driver exists.
+
+    libgpiod v2 note: unlike v1's Chip.get_line(offset) -> persistent Line
+    object, v2 is request-based: gpiod.request_lines(chip_path, config={...})
+    returns a LineRequest that can cover one or more offsets. Every pin here
+    gets its OWN single-line request so each can be independently released/
+    reconfigured (the IRQ pin in particular needs reconfigure_lines() to add
+    edge detection after being requested as a plain input at open() time).
+    request.set_value()/get_value() therefore take the pin OFFSET as their
+    first argument (a request can cover multiple lines), unlike v1's
+    line.set_value()/get_value() which took none.
     """
 
-    # ---- pin value polarity (libgpiod returns 0/1 ints, not constants) -----
-    LOW  = 0
-    HIGH = 1
+    # ---- pin value polarity: gpiod.line.Value enum members, not raw ints ---
+    LOW  = _GpiodValue.INACTIVE if _GpiodValue is not None else 0
+    HIGH = _GpiodValue.ACTIVE if _GpiodValue is not None else 1
 
     def __init__(self,
                  spi_bus=0,
@@ -328,6 +348,7 @@ class SX126xRadio:
                  pin_rxen=-1,
                  pin_cs=-1,
                  gpiochip="gpiochip0",
+                 pin_gpiochips=None,
                  dio3_tcxo_voltage=None,
                  dio3_tcxo_delay_ms=5,
                  busy_timeout_ms=5000,
@@ -345,7 +366,22 @@ class SX126xRadio:
                  path (works when the SPI controller's CE pin is wired to
                  the chip's NSS, e.g. some onboard SX126x modules with a
                  hardwired CE<->NSS connection, or via
-                 `dtoverlay=spi0-1cs,cs0_pin=<n>`)."""
+                 `dtoverlay=spi0-1cs,cs0_pin=<n>`).
+
+        pin_gpiochips : optional dict {"cs"|"reset"|"busy"|"irq"|"txen"|"rxen":
+                 gpiochip_path}. Most boards wire every control pin to the
+                 SAME gpiochip, in which case the single `gpiochip` argument
+                 is all that's needed and this can be left as None. Some
+                 boards (e.g. the Luckfox Lyra Zero W) wire different pins
+                 to DIFFERENT gpiochips (RESET/BUSY on gpiochip0, IRQ/TXEN/
+                 RXEN on gpiochip1) - pass a per-pin override here for those.
+                 Any pin field missing from this dict falls back to the
+                 single `gpiochip` default. Discovered live: without this,
+                 a pin whose line OFFSET happens to coincide with an
+                 already-claimed line on the WRONG chip fails with a
+                 confusing "Device or resource busy" that looks like a real
+                 hardware conflict but is actually just asking the wrong
+                 gpiochip for that offset."""
         if spidev is None:
             raise SX126xError("spidev module not available; install python3-spidev")
         if gpiod is None:
@@ -361,13 +397,19 @@ class SX126xRadio:
         self.pin_rxen      = pin_rxen
         self.pin_cs        = pin_cs
         self.gpiochip_name = gpiochip
+        _chips = pin_gpiochips or {}
+        self.gpiochip_cs    = _chips.get("cs", gpiochip)
+        self.gpiochip_reset = _chips.get("reset", gpiochip)
+        self.gpiochip_busy  = _chips.get("busy", gpiochip)
+        self.gpiochip_irq   = _chips.get("irq", gpiochip)
+        self.gpiochip_txen  = _chips.get("txen", gpiochip)
+        self.gpiochip_rxen  = _chips.get("rxen", gpiochip)
         self.dio3_tcxo_voltage = dio3_tcxo_voltage
         self.dio3_tcxo_delay_ms = dio3_tcxo_delay_ms
         self.busy_timeout_ms = busy_timeout_ms
 
         # Hardware handles (None until open())
         self._spi          = None
-        self._chip         = None
         self._line_reset   = None
         self._line_busy    = None
         self._line_irq     = None
@@ -388,6 +430,46 @@ class SX126xRadio:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _request_lines_retrying(chip_path, consumer, config, retries=5, delay_s=0.05):
+        """gpiod.request_lines() wrapper that retries on OSError (errno 16,
+        "Device or resource busy"). Observed live on the RK3506B vendor
+        kernel: individual GPIO lines can transiently report busy for a few
+        tens of milliseconds right after another pin on the SoC is toggled
+        (e.g. immediately after the RESET pin bounce), even though nothing
+        else ever shows up as holding the line (checked via
+        gpiod.Chip.get_line_info() and /sys/kernel/debug/pinctrl - both
+        report the pin as fully unclaimed within a second of the failure).
+        This is *not* a fix for a real external conflict - if the line is
+        genuinely held by another process/driver forever, this will still
+        raise after exhausting retries."""
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                return gpiod.request_lines(chip_path, consumer=consumer, config=config)
+            except OSError as exc:
+                if getattr(exc, "errno", None) != 16:  # not EBUSY - don't retry
+                    raise
+                last_exc = exc
+                # DIAGNOSTIC (temporary): dump the chip's own view of every
+                # line's holder from INSIDE this same process, before
+                # anything unwinds/releases. If this process itself already
+                # holds the offset (e.g. a duplicate open() call), the
+                # consumer string here will be one of ours ("sx126x-*").
+                try:
+                    with gpiod.Chip(chip_path) as _diag_chip:
+                        for off in range(32):
+                            info = _diag_chip.get_line_info(off)
+                            if info.used:
+                                print(f"[gpio-diag] {chip_path} line {off}: "
+                                      f"used=True consumer={info.consumer!r}",
+                                      flush=True)
+                except Exception as diag_exc:
+                    print(f"[gpio-diag] failed: {diag_exc!r}", flush=True)
+                if attempt < retries - 1:
+                    time.sleep(delay_s)
+        raise last_exc
 
     def open(self):
         """Open SPI, claim GPIO lines, hardware-reset the chip, and put it
@@ -413,82 +495,81 @@ class SX126xRadio:
                 # nowhere on a `spi0-0cs` overlay, so it's harmless.
                 pass
 
-        # --- GPIO chip ---
-        self._chip = gpiod.Chip(self.gpiochip_name)
+        # --- GPIO lines (libgpiod v2: request-based, no persistent Chip) ---
+        # Each pin gets its OWN single-line request via the top-level
+        # gpiod.request_lines(chip_path, config={offset: LineSettings(...)})
+        # convenience function, rather than v1's Chip.get_line(offset) then
+        # line.request(). gpiochip_name must be a full device path (e.g.
+        # "/dev/gpiochip0") under v2 - a bare "gpiochip0" name raises
+        # FileNotFoundError.
 
         # --- CS / NSS (active-low chip-select, driven LOW per SPI transaction
         #     if pin_cs was configured; otherwise spidev's hardware-CE handles
         #     it). Idle state is HIGH so the SX126x ignores the bus between
         #     transactions. ---
         if self.pin_cs is not None and self.pin_cs >= 0:
-            self._line_cs = self._chip.get_line(self.pin_cs)
-            self._line_cs.request(
+            self._line_cs = self._request_lines_retrying(
+                self.gpiochip_cs,
                 consumer="sx126x-cs",
-                type=gpiod.LINE_REQ_DIR_OUT,
-                default_val=self.HIGH,   # idle (de-asserted)
+                config={self.pin_cs: gpiod.LineSettings(
+                    direction=_GpiodDirection.OUTPUT,
+                    output_value=self.HIGH,   # idle (de-asserted)
+                )},
             )
 
         # --- RESET (output, default high so we start de-asserted) ---
-        #
-        # libgpiod 1.6.x exposes direction / event-type / flag selectors as
-        # *module-level integer constants* (not LineRequest enum members):
-        #
-        #     gpiod.LINE_REQ_DIR_OUT        # = 3  (output)
-        #     gpiod.LINE_REQ_DIR_IN         # = 2  (input)
-        #     gpiod.LINE_REQ_EV_RISING_EDGE # rising-edge event
-        #     gpiod.LINE_REQ_EV_FALLING_EDGE
-        #     gpiod.LINE_REQ_EV_BOTH_EDGES
-        #     gpiod.LINE_REQ_FLAG_*         # BIAS_PULL_UP, ACTIVE_LOW, ...
-        #
-        # These are passed positionally as `type=` to line.request(); the
-        # 4th arg `default_val` is the initial output level for outputs.
-        # See `help(gpiod.Line.request)` on a real device:
-        #     request(consumer [, type [, flags [, default_val]]]) -> None
-        self._line_reset = self._chip.get_line(self.pin_reset)
-        self._line_reset.request(
+        self._line_reset = self._request_lines_retrying(
+            self.gpiochip_reset,
             consumer="sx126x-reset",
-            type=gpiod.LINE_REQ_DIR_OUT,
-            default_val=self.HIGH,
+            config={self.pin_reset: gpiod.LineSettings(
+                direction=_GpiodDirection.OUTPUT,
+                output_value=self.HIGH,
+            )},
         )
 
         # --- BUSY (input, no pull — BUSY is push-pull from the chip) ---
-        self._line_busy = self._chip.get_line(self.pin_busy)
-        self._line_busy.request(
+        self._line_busy = self._request_lines_retrying(
+            self.gpiochip_busy,
             consumer="sx126x-busy",
-            type=gpiod.LINE_REQ_DIR_IN,
+            config={self.pin_busy: gpiod.LineSettings(direction=_GpiodDirection.INPUT)},
         )
 
         # --- IRQ (input; not requested as edge until request_irq_edge()) ---
         if self.pin_irq is not None and self.pin_irq >= 0:
-            self._line_irq = self._chip.get_line(self.pin_irq)
-            # Don't request it as an event line yet — caller decides when.
-            # Request as a plain input first so it's claimed/known.
-            self._line_irq.request(
+            # Don't request edge detection yet — caller decides when, via
+            # reconfigure_lines() in request_irq_edge(). Request as a plain
+            # input first so it's claimed/known.
+            self._line_irq = self._request_lines_retrying(
+                self.gpiochip_irq,
                 consumer="sx126x-irq",
-                type=gpiod.LINE_REQ_DIR_IN,
+                config={self.pin_irq: gpiod.LineSettings(direction=_GpiodDirection.INPUT)},
             )
 
         # --- TXEN / RXEN (optional outputs) ---
         if self.pin_txen is not None and self.pin_txen >= 0:
-            self._line_txen = self._chip.get_line(self.pin_txen)
-            self._line_txen.request(
+            self._line_txen = self._request_lines_retrying(
+                self.gpiochip_txen,
                 consumer="sx126x-txen",
-                type=gpiod.LINE_REQ_DIR_OUT,
-                default_val=self.LOW,
+                config={self.pin_txen: gpiod.LineSettings(
+                    direction=_GpiodDirection.OUTPUT,
+                    output_value=self.LOW,
+                )},
             )
         if self.pin_rxen is not None and self.pin_rxen >= 0:
-            self._line_rxen = self._chip.get_line(self.pin_rxen)
-            self._line_rxen.request(
+            self._line_rxen = self._request_lines_retrying(
+                self.gpiochip_rxen,
                 consumer="sx126x-rxen",
-                type=gpiod.LINE_REQ_DIR_OUT,
-                default_val=self.LOW,
+                config={self.pin_rxen: gpiod.LineSettings(
+                    direction=_GpiodDirection.OUTPUT,
+                    output_value=self.LOW,
+                )},
             )
 
         # --- Hardware reset sequence (per SX126x datasheet §4.1) ---
         # Drive RESET low, hold >= 100us, drive high, then wait for BUSY low.
-        self._line_reset.set_value(self.LOW)
+        self._line_reset.set_value(self.pin_reset, self.LOW)
         time.sleep(0.001)              # 1 ms; LoRaRF uses 1 ms and it works
-        self._line_reset.set_value(self.HIGH)
+        self._line_reset.set_value(self.pin_reset, self.HIGH)
         self._wait_busy(self.busy_timeout_ms)
 
         # --- Sanity check: chip responds to SetStandby + GetStatus ---
@@ -539,7 +620,7 @@ class SX126xRadio:
                      self._line_busy, self._line_reset):
             if line is not None:
                 try:
-                    line.release()
+                    line.release()  # LineRequest.release() - same name in v2
                 except Exception:
                     pass
 
@@ -552,7 +633,6 @@ class SX126xRadio:
         self._line_reset = self._line_busy = self._line_irq = None
         self._line_txen  = self._line_rxen  = None
         self._line_cs    = None
-        self._chip       = None
         self._spi        = None
 
     # ------------------------------------------------------------------
@@ -564,9 +644,9 @@ class SX126xRadio:
         to go low (with busy_timeout_ms budget)."""
         if self._line_reset is None:
             raise SX126xError("reset() called before open()")
-        self._line_reset.set_value(self.LOW)
+        self._line_reset.set_value(self.pin_reset, self.LOW)
         time.sleep(0.001)
-        self._line_reset.set_value(self.HIGH)
+        self._line_reset.set_value(self.pin_reset, self.HIGH)
         self._wait_busy(self.busy_timeout_ms)
 
     # ------------------------------------------------------------------
@@ -580,7 +660,7 @@ class SX126xRadio:
         # Most BUSY transitions finish in <<1ms, but the chip can hold BUSY
         # for several ms after SetDio3AsTcxoCtrl while the TCXO warms.
         # A 1ms sleep keeps CPU usage negligible vs. a true busy-spin.
-        while self._line_busy.get_value() == self.HIGH:
+        while self._line_busy.get_value(self.pin_busy) == self.HIGH:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.001)
@@ -594,11 +674,11 @@ class SX126xRadio:
         buf = bytes([opcode]) + (data if isinstance(data, (bytes, bytearray)) else bytes(data))
         if self._line_cs is not None:
             # Bit-banged CS (active-low). Assert LOW, transaction, deassert HIGH.
-            self._line_cs.set_value(self.LOW)
+            self._line_cs.set_value(self.pin_cs, self.LOW)
             try:
                 self._spi.xfer2(list(buf))
             finally:
-                self._line_cs.set_value(self.HIGH)
+                self._line_cs.set_value(self.pin_cs, self.HIGH)
         else:
             self._spi.xfer2(list(buf))
 
@@ -628,11 +708,11 @@ class SX126xRadio:
         n_addr = len(address)
         buf = bytes([opcode]) + bytes(address) + (b"\x00" * (n_data + 1))
         if self._line_cs is not None:
-            self._line_cs.set_value(self.LOW)
+            self._line_cs.set_value(self.pin_cs, self.LOW)
             try:
                 feedback = self._spi.xfer2(list(buf))
             finally:
-                self._line_cs.set_value(self.HIGH)
+                self._line_cs.set_value(self.pin_cs, self.HIGH)
         else:
             feedback = self._spi.xfer2(list(buf))
         # Layout of feedback:
@@ -899,31 +979,33 @@ class SX126xRadio:
     # ------------------------------------------------------------------
 
     def request_irq_edge(self, edge="rising"):
-        """Re-request the IRQ line as an *event* line so that
+        """Reconfigure the IRQ line in-place to add edge detection so that
         wait_irq_done() can block on it instead of polling.
 
         edge may be "rising", "falling", or "both". The SX126x datasheet
         says IRQ is active-high and goes high when a configured event
-        fires, so "rising" is the normal choice."""
+        fires, so "rising" is the normal choice.
+
+        libgpiod v2 note: unlike v1 (which required release() + a fresh
+        request() to change the line's event mode), v2's
+        LineRequest.reconfigure_lines() changes the existing request's
+        settings in place — no release/re-request, no risk of a gap where
+        the line briefly has no owner."""
         if self._line_irq is None:
             raise SX126xError("No IRQ pin configured (pin_irq is None or < 0)")
-        # Release any prior request — request_irq_edge() may be called
-        # repeatedly across TX/RX cycles.
-        try:
-            self._line_irq.release()
-        except Exception:
-            pass
         if edge == "rising":
-            edge_type = gpiod.LINE_REQ_EV_RISING_EDGE
+            edge_type = _GpiodEdge.RISING
         elif edge == "falling":
-            edge_type = gpiod.LINE_REQ_EV_FALLING_EDGE
+            edge_type = _GpiodEdge.FALLING
         elif edge == "both":
-            edge_type = gpiod.LINE_REQ_EV_BOTH_EDGES
+            edge_type = _GpiodEdge.BOTH
         else:
             raise ValueError("edge must be rising|falling|both")
-        self._line_irq.request(
-            consumer="sx126x-irq-event",
-            type=edge_type,
+        self._line_irq.reconfigure_lines(
+            config={self.pin_irq: gpiod.LineSettings(
+                direction=_GpiodDirection.INPUT,
+                edge_detection=edge_type,
+            )},
         )
         self._irq_requested = True
 
@@ -933,13 +1015,8 @@ class SX126xRadio:
         if self._line_irq is None:
             return
         try:
-            self._line_irq.release()
-        except Exception:
-            pass
-        try:
-            self._line_irq.request(
-                consumer="sx126x-irq",
-                type=gpiod.LINE_REQ_DIR_IN,
+            self._line_irq.reconfigure_lines(
+                config={self.pin_irq: gpiod.LineSettings(direction=_GpiodDirection.INPUT)},
             )
         except Exception:
             pass
@@ -966,29 +1043,25 @@ class SX126xRadio:
                 # since the last call (e.g. from earlier SetStandby calls
                 # that re-triggered DIO1, or from a previous wait_irq_done
                 # that returned but didn't fully drain). Without this, a
-                # stale FIFO entry can fire event_wait() immediately with
-                # an IRQ status from a previous operation.
-                while True:
-                    has_event = self._line_irq.event_wait(0, 0)
-                    if not has_event:
-                        break
+                # stale FIFO entry can fire wait_edge_events() immediately
+                # with an IRQ status from a previous operation.
+                # (libgpiod v2.x: wait_edge_events(timeout) + read_edge_events();
+                # timeout=0 is the non-blocking "is anything pending?" check.)
+                while self._line_irq.wait_edge_events(0):
                     try:
-                        self._line_irq.event_read()
+                        self._line_irq.read_edge_events()
                     except Exception:
-                        pass
-                # Edge-wait path — blocks in the kernel until the line
-                # fires (libgpiod v1.x: event_wait(sec, nsec)).
+                        break
+                # Edge-wait path — blocks in the kernel until the line fires.
                 remaining = deadline - time.monotonic()
                 if remaining < 0:
                     remaining = 0.0
-                secs  = int(remaining)
-                nsecs = int((remaining - secs) * 1_000_000_000)
-                fired = self._line_irq.event_wait(secs, nsecs)
+                fired = self._line_irq.wait_edge_events(remaining)
                 if not fired:
                     return None
                 # Drain the event so the next wait_irq_done() can re-arm.
                 try:
-                    self._line_irq.event_read()
+                    self._line_irq.read_edge_events()
                 except Exception:
                     pass
                 return self.get_irq_status()
@@ -1161,11 +1234,11 @@ class SX126xRadio:
         if self._line_txen is None:
             return
         if on:
-            self._tx_state = self._line_txen.get_value()
-            self._line_txen.set_value(self.HIGH)
+            self._tx_state = self._line_txen.get_value(self.pin_txen)
+            self._line_txen.set_value(self.pin_txen, self.HIGH)
             if self._line_rxen is not None:
-                self._rx_state = self._line_rxen.get_value()
-                self._line_rxen.set_value(self.LOW)
+                self._rx_state = self._line_rxen.get_value(self.pin_rxen)
+                self._line_rxen.set_value(self.pin_rxen, self.LOW)
 
     def set_rx_enable(self, on):
         """Drive the external RXEN pin (if wired). Saves the prior state
@@ -1173,11 +1246,11 @@ class SX126xRadio:
         if self._line_rxen is None:
             return
         if on:
-            self._rx_state = self._line_rxen.get_value()
-            self._line_rxen.set_value(self.HIGH)
+            self._rx_state = self._line_rxen.get_value(self.pin_rxen)
+            self._line_rxen.set_value(self.pin_rxen, self.HIGH)
             if self._line_txen is not None:
-                self._tx_state = self._line_txen.get_value()
-                self._line_txen.set_value(self.LOW)
+                self._tx_state = self._line_txen.get_value(self.pin_txen)
+                self._line_txen.set_value(self.pin_txen, self.LOW)
 
     def restore_tx_rx_pins(self):
         """Restore TXEN/RXEN to whatever they were before the most recent
@@ -1185,12 +1258,12 @@ class SX126xRadio:
         behaviour."""
         if self._line_txen is not None:
             try:
-                self._line_txen.set_value(self._tx_state)
+                self._line_txen.set_value(self.pin_txen, self._tx_state)
             except Exception:
                 pass
         if self._line_rxen is not None:
             try:
-                self._line_rxen.set_value(self._rx_state)
+                self._line_rxen.set_value(self.pin_rxen, self._rx_state)
             except Exception:
                 pass
 

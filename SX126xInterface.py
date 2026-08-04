@@ -968,6 +968,28 @@ class SX126xInterface(Interface):
         self.pin_reset = _line_of("reset")
         self.pin_txen  = _line_of("txen")
         self.pin_rxen  = _line_of("rxen")
+        # Per-pin gpiochip path, since some boards (e.g. the Luckfox Lyra
+        # Zero W) wire different control pins to DIFFERENT gpiochips - the
+        # single shared `self.gpiochip` default is only correct for
+        # single-chip boards (Raspberry Pi, femtofox). Missing/unwired
+        # pins fall back to the platform default so single-chip boards are
+        # unaffected. Discovered live: passing only the single default
+        # gpiochip caused the driver to request the wrong chip's line for
+        # any pin not on that default chip, colliding with an unrelated,
+        # already-claimed line (e.g. the kernel's own SPI0 hardware CS0)
+        # and failing with a confusing "Device or resource busy" that had
+        # nothing to do with the pin actually being fought over.
+        def _chip_of(field):
+            v = self.pin_lines.get(field)
+            return self.gpiochip if v is None else v[0]
+        self.pin_gpiochips = {
+            "cs":    _chip_of("cs"),
+            "irq":   _chip_of("irq"),
+            "busy":  _chip_of("busy"),
+            "reset": _chip_of("reset"),
+            "txen":  _chip_of("txen"),
+            "rxen":  _chip_of("rxen"),
+        }
 
         # NOTICE log of the final resolved values — primary defense against
         # silent misconfiguration across the new 2-layer profile system.
@@ -1179,6 +1201,7 @@ class SX126xInterface(Interface):
             pin_rxen=self.pin_rxen,
             pin_cs=self.pin_cs,
             gpiochip=self.gpiochip,
+            pin_gpiochips=self.pin_gpiochips,
             dio3_tcxo_voltage=self.dio3_tcxo if self.dio3_tcxo and self.dio3_tcxo > 0 else None,
             dio3_tcxo_delay_ms=self.tcxo_delay_ms,
             busy_timeout_ms=5000,
