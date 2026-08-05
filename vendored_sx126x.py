@@ -349,6 +349,8 @@ class SX126xRadio:
                  pin_cs=-1,
                  gpiochip="gpiochip0",
                  pin_gpiochips=None,
+                 txen_active_low=False,
+                 rxen_active_low=False,
                  dio3_tcxo_voltage=None,
                  dio3_tcxo_delay_ms=5,
                  busy_timeout_ms=5000,
@@ -396,6 +398,15 @@ class SX126xRadio:
         self.pin_txen      = pin_txen
         self.pin_rxen      = pin_rxen
         self.pin_cs        = pin_cs
+        # Polarity of the txen/rxen "enabled" state. Most boards seen so far
+        # (e.g. MeshAdv-style TXEN/RXEN pairs) are active-HIGH for both, but
+        # the Station G3's LNA enable pin is active-LOW (LNA ON = logic 0,
+        # per BQ's own lna_control.sh script) - so this can't be assumed.
+        # Kept as separate flags (not folded into pin_gpiochips) since
+        # polarity is a property of the SIGNAL, not of which gpiochip it
+        # lives on.
+        self.txen_active_low = txen_active_low
+        self.rxen_active_low = rxen_active_low
 
         # libgpiod v2's gpiod.request_lines()/gpiod.Chip() require a full
         # device path (e.g. "/dev/gpiochip0") — a bare chip name like
@@ -1241,6 +1252,19 @@ class SX126xRadio:
     # TXEN/RXEN GPIOs where the board doesn't rely on DIO2-as-RF-switch)
     # ------------------------------------------------------------------
 
+    def _txen_level(self, enabled):
+        """Resolve the raw HIGH/LOW to write to the TXEN pin for a logical
+        enabled/disabled state, honoring txen_active_low."""
+        if self.txen_active_low:
+            return self.LOW if enabled else self.HIGH
+        return self.HIGH if enabled else self.LOW
+
+    def _rxen_level(self, enabled):
+        """Same as _txen_level(), for the RXEN/LNA-enable pin."""
+        if self.rxen_active_low:
+            return self.LOW if enabled else self.HIGH
+        return self.HIGH if enabled else self.LOW
+
     def set_tx_enable(self, on):
         """Drive the external TXEN pin (if wired). Saves the prior state
         so the caller can restore it after TX."""
@@ -1248,10 +1272,10 @@ class SX126xRadio:
             return
         if on:
             self._tx_state = self._line_txen.get_value(self.pin_txen)
-            self._line_txen.set_value(self.pin_txen, self.HIGH)
+            self._line_txen.set_value(self.pin_txen, self._txen_level(True))
             if self._line_rxen is not None:
                 self._rx_state = self._line_rxen.get_value(self.pin_rxen)
-                self._line_rxen.set_value(self.pin_rxen, self.LOW)
+                self._line_rxen.set_value(self.pin_rxen, self._rxen_level(False))
 
     def set_rx_enable(self, on):
         """Drive the external RXEN pin (if wired). Saves the prior state
@@ -1260,10 +1284,10 @@ class SX126xRadio:
             return
         if on:
             self._rx_state = self._line_rxen.get_value(self.pin_rxen)
-            self._line_rxen.set_value(self.pin_rxen, self.HIGH)
+            self._line_rxen.set_value(self.pin_rxen, self._rxen_level(True))
             if self._line_txen is not None:
                 self._tx_state = self._line_txen.get_value(self.pin_txen)
-                self._line_txen.set_value(self.pin_txen, self.LOW)
+                self._line_txen.set_value(self.pin_txen, self._txen_level(False))
 
     def restore_tx_rx_pins(self):
         """Restore TXEN/RXEN to whatever they were before the most recent

@@ -61,7 +61,7 @@
 #                                                                            #
 # Bundled profiles (see PLATFORM_PROFILES and BOARD_PROFILES dicts below):   #
 #   platforms: raspberry-pi, luckfox-pico                                    #
-#   boards:    meshadv-pi-hat-v1.1, femtofox-integrated-v1,                  #
+#   boards:    meshadv-pi-hat-v1.1, femtofox-integrated-v1, station-g3,      #
 #              generic-sx1262-manual                                        #
 #                                                                            #
 # Place SX126xInterface.py and vendored_sx126x.py in                         #
@@ -367,6 +367,68 @@ BOARD_PROFILES = {
             "has no separate TXEN GPIO (TXEN is bridged to DIO2 internally), "
             "so header_pin_txen is -1 and the driver relies on DIO2-as-RF-"
             "switch control. Module uses a TCXO on DIO3 at 1.8V."
+        ),
+    },
+
+    "station-g3": {
+        "board_name":        "station-g3",
+        "profile_version":   1,
+        # BQ/Uniteng Station G3 devkit, Raspberry Pi Zero 2W MCU
+        # daughterboard path, Primary RF Slot (populated by default with
+        # the BQ35LORA900V1M SX1262 module). NOT YET hardware-verified -
+        # derived from BQ's own published meshtasticd YAML example config,
+        # a live `pinctrl get 7-25` dump from BQ's own test rig, and
+        # rep-provided lna_control.sh/pa_control.sh scripts. See
+        # Reticulum-StationG3/HARDWARE-RECON.md for the full derivation.
+        "header_pin_cs":     -1,   # SPI0 CE0 (BCM8/physical 24) - native
+                                   # spidev hardware CS, not bit-banged.
+        "header_pin_irq":    15,  # physical pin 15 -> BCM22 (DIO1/IRQ,
+                                   # per BQ's meshtasticd config: IRQ: 22)
+        "header_pin_busy":   18,  # physical pin 18 -> BCM24 (BUSY,
+                                   # per BQ's meshtasticd config: Busy: 24)
+        "header_pin_reset":  36,  # physical pin 36 -> BCM16 (RESET,
+                                   # per BQ's meshtasticd config: Reset: 16)
+        "header_pin_txen":   11,  # physical pin 11 -> BCM17 = PA enable.
+                                   # Rep-confirmed "pin 11 PA Mode"; matches
+                                   # pa_control.sh's GPIO_PIN=17 exactly.
+                                   # Active-HIGH (PAHIGH -> gpioset ...=1),
+                                   # matching the driver's existing txen
+                                   # assumption - no polarity flag needed.
+        "header_pin_rxen":   16,  # physical pin 16 -> BCM23 = LNA enable.
+                                   # Rep-confirmed "pin 16 Primary Slot LNA
+                                   # Mode"; matches lna_control.sh's
+                                   # GPIO_PIN=23 exactly. Active-LOW
+                                   # (LNAON -> gpioset ...=0) - OPPOSITE of
+                                   # the driver's historical rxen
+                                   # assumption, hence rxen_active_low.
+        "txen_active_low":   False,
+        "rxen_active_low":   True,
+        "spi_bus":           0,
+        "spi_cs":            0,
+        "dio2_rf_switch":    True,
+        "dio3_tcxo_voltage": 1.8,   # ASSUMED by analogy with the ESP32-S3
+                                    # daughterboard path's confirmed spec
+                                    # (same BQ35LORA900V1M RF module either
+                                    # way) - not independently confirmed
+                                    # for the RPi path's exact YAML value.
+        "tcxo_delay_ms":     5.0,
+        "txpower_max":       22,   # chip-level max before the external PA;
+                                    # matches MAX_LORA_TX_POWER=22 from the
+                                    # ESP32-S3/MeshCore reference config.
+        "rx_boosted_gain":   True,
+        "profile_notes": (
+            "BQ/Uniteng Station G3, Raspberry Pi Zero 2W daughterboard, "
+            "Primary RF Slot (BQ35LORA900V1M / SX1262). NOT YET hardware-"
+            "verified - pin mapping derived from BQ's own published docs "
+            "and scripts, not confirmed on a physical board. Requires "
+            "`dtparam=i2c_arm=on`, `dtoverlay=spi0-1cs`, "
+            "`dtoverlay=spi1-1cs` in /boot/firmware/config.txt per BQ's "
+            "own troubleshooting notes. Station G3 adds software-"
+            "controllable PA/LNA enable GPIOs over Station G2, which only "
+            "has physical jumpers for this - the underlying LoRa/SPI "
+            "pinout is otherwise identical between G2 and G3 (rep-"
+            "confirmed firmware compatibility). See "
+            "Reticulum-StationG3/HARDWARE-RECON.md for the full recon."
         ),
     },
 
@@ -702,6 +764,13 @@ class _ProfileResolver:
         tcxo_delay_ms     = self._float_or(board.get("tcxo_delay_ms", 5.0), 5.0)
         txpower_max       = self._int_or(board.get("txpower_max", 22), 22)
         rx_boosted_gain   = self._bool_or(board.get("rx_boosted_gain", True), True)
+        # Polarity of the external TXEN/RXEN "enabled" state. Almost every
+        # board so far is active-HIGH for both (the historical assumption
+        # baked into the driver), but the Station G3's LNA-enable pin is
+        # active-LOW (LNA ON = logic 0, per BQ's own lna_control.sh) - so
+        # this can no longer be assumed true for every board.
+        txen_active_low   = self._bool_or(board.get("txen_active_low", False), False)
+        rxen_active_low   = self._bool_or(board.get("rxen_active_low", False), False)
 
         for key, parser, current in (
             ("dio2_rf_switch",    self._bool_or, dio2_rf_switch),
@@ -709,6 +778,8 @@ class _ProfileResolver:
             ("tcxo_delay_ms",     self._float_or, tcxo_delay_ms),
             ("txpower_max",       self._int_or, txpower_max),
             ("rx_boosted_gain",   self._bool_or, rx_boosted_gain),
+            ("txen_active_low",   self._bool_or, txen_active_low),
+            ("rxen_active_low",   self._bool_or, rxen_active_low),
         ):
             if key in config:
                 raw = config[key]
@@ -717,6 +788,8 @@ class _ProfileResolver:
                     overrides_used.append((key, current, new_val))
                     if   parser is self._bool_or:  dio2_rf_switch = new_val if key == "dio2_rf_switch" else dio2_rf_switch
                     if   parser is self._bool_or:  rx_boosted_gain   = new_val if key == "rx_boosted_gain" else rx_boosted_gain
+                    if   parser is self._bool_or:  txen_active_low   = new_val if key == "txen_active_low" else txen_active_low
+                    if   parser is self._bool_or:  rxen_active_low   = new_val if key == "rxen_active_low" else rxen_active_low
                     if   parser is self._float_or: dio3_tcxo_voltage = new_val if key == "dio3_tcxo_voltage" else dio3_tcxo_voltage
                     if   parser is self._float_or: tcxo_delay_ms     = new_val if key == "tcxo_delay_ms" else tcxo_delay_ms
                     if   parser is self._int_or:   txpower_max       = new_val if key == "txpower_max" else txpower_max
@@ -738,6 +811,8 @@ class _ProfileResolver:
             "tcxo_delay_ms":     tcxo_delay_ms,
             "txpower_max":       txpower_max,
             "rx_boosted_gain":   rx_boosted_gain,
+            "txen_active_low":   txen_active_low,
+            "rxen_active_low":   rxen_active_low,
             "overrides_used":    overrides_used,
         }
 
@@ -955,6 +1030,8 @@ class SX126xInterface(Interface):
         self.tcxo_delay_ms     = resolution["tcxo_delay_ms"]
         self.txpower_max       = resolution["txpower_max"]
         self.rx_boosted_gain   = resolution["rx_boosted_gain"]
+        self.txen_active_low   = resolution.get("txen_active_low", False)
+        self.rxen_active_low   = resolution.get("rxen_active_low", False)
         # pin_lines is {pin_field_name: (gpiochip, line) | None}
         self.pin_lines = resolution["pin_lines"]
         # Convenience accessor for the legacy attribute name (used in
@@ -1199,6 +1276,8 @@ class SX126xInterface(Interface):
             pin_irq=self.pin_irq,
             pin_txen=self.pin_txen,
             pin_rxen=self.pin_rxen,
+            txen_active_low=self.txen_active_low,
+            rxen_active_low=self.rxen_active_low,
             pin_cs=self.pin_cs,
             gpiochip=self.gpiochip,
             pin_gpiochips=self.pin_gpiochips,
