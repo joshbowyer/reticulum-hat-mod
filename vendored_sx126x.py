@@ -396,14 +396,27 @@ class SX126xRadio:
         self.pin_txen      = pin_txen
         self.pin_rxen      = pin_rxen
         self.pin_cs        = pin_cs
-        self.gpiochip_name = gpiochip
+
+        # libgpiod v2's gpiod.request_lines()/gpiod.Chip() require a full
+        # device path (e.g. "/dev/gpiochip0") — a bare chip name like
+        # "gpiochip0" raises FileNotFoundError (v1's Chip.get_line() API
+        # accepted bare names, so board/platform profiles historically
+        # specified them without the "/dev/" prefix). Normalize here, once,
+        # at the point of construction, rather than requiring every profile
+        # table entry to be rewritten with the full path.
+        def _normalize_chip_path(name):
+            if isinstance(name, str) and not name.startswith("/dev/"):
+                return "/dev/" + name
+            return name
+
+        self.gpiochip_name = _normalize_chip_path(gpiochip)
         _chips = pin_gpiochips or {}
-        self.gpiochip_cs    = _chips.get("cs", gpiochip)
-        self.gpiochip_reset = _chips.get("reset", gpiochip)
-        self.gpiochip_busy  = _chips.get("busy", gpiochip)
-        self.gpiochip_irq   = _chips.get("irq", gpiochip)
-        self.gpiochip_txen  = _chips.get("txen", gpiochip)
-        self.gpiochip_rxen  = _chips.get("rxen", gpiochip)
+        self.gpiochip_cs    = _normalize_chip_path(_chips.get("cs", gpiochip))
+        self.gpiochip_reset = _normalize_chip_path(_chips.get("reset", gpiochip))
+        self.gpiochip_busy  = _normalize_chip_path(_chips.get("busy", gpiochip))
+        self.gpiochip_irq   = _normalize_chip_path(_chips.get("irq", gpiochip))
+        self.gpiochip_txen  = _normalize_chip_path(_chips.get("txen", gpiochip))
+        self.gpiochip_rxen  = _normalize_chip_path(_chips.get("rxen", gpiochip))
         self.dio3_tcxo_voltage = dio3_tcxo_voltage
         self.dio3_tcxo_delay_ms = dio3_tcxo_delay_ms
         self.busy_timeout_ms = busy_timeout_ms
