@@ -412,9 +412,23 @@ BOARD_PROFILES = {
                                     # way) - not independently confirmed
                                     # for the RPi path's exact YAML value.
         "tcxo_delay_ms":     5.0,
-        "txpower_max":       22,   # chip-level max before the external PA;
-                                    # matches MAX_LORA_TX_POWER=22 from the
-                                    # ESP32-S3/MeshCore reference config.
+        # SAFETY CAP, not yet a calibrated limit: capped low (chip-level 7dBm,
+        # not the chip's real max of 22dBm) to keep actual RF output (after
+        # the external PA) comfortably under Station G3's documented ~2W
+        # false-OVP-trip threshold (see Reticulum-StationG3/HARDWARE-RECON.md)
+        # until real hardware arrives and the PA gain curve for THIS specific
+        # RPi-Zero-2W daughterboard path can be measured. Basis: the ESP32-S3
+        # daughterboard path's own reference config uses chip-level 7dBm to
+        # reach ~27dBm/0.5W actual (implying ~20dB of PA gain on this same
+        # BQ35LORA900V1M module) - reusing that same chip-level value here
+        # gives an actual-output estimate safely under the 1W/30dBm target
+        # even if this path's PA gain turns out somewhat higher than assumed.
+        # This value is NOT currently enforced automatically elsewhere in this
+        # file for other profiles (txpower_max was previously informational
+        # only) - see the new hard-cap check added in __init__ below, which
+        # now clamps user-configured `txpower` to this profile's txpower_max
+        # for every board, not just this one.
+        "txpower_max":       7,
         "rx_boosted_gain":   True,
         "profile_notes": (
             "BQ/Uniteng Station G3, Raspberry Pi Zero 2W daughterboard, "
@@ -1209,6 +1223,23 @@ class SX126xInterface(Interface):
         if txpower < -9 or txpower > 22:
             RNS.log("Invalid TX power configured for " + str(self), RNS.LOG_ERROR)
             validcfg = False
+        # Enforce the resolved board profile's txpower_max as a hard ceiling,
+        # not just an informational value (previously only logged, never
+        # actually checked against the user-configured txpower - a real gap,
+        # since some board profiles have external PAs where the chip-level
+        # dBm setting does NOT correspond 1:1 to actual radiated power, and
+        # exceeding a board's safe chip-level ceiling can mean exceeding the
+        # board's actual safe RF output limit). Clamp rather than reject, so
+        # a config written for one board (or with a stale/high txpower left
+        # over from testing) doesn't take the whole interface offline - just
+        # silently caps to what's safe for this specific board.
+        if txpower > self.txpower_max:
+            RNS.log(str(self) + " configured txpower " + str(txpower) +
+                    " dBm exceeds this board's safe txpower_max of " +
+                    str(self.txpower_max) + " dBm - capping to " +
+                    str(self.txpower_max) + " dBm", RNS.LOG_WARNING)
+            txpower = self.txpower_max
+            self.txpower = txpower
         if bandwidth not in [7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000]:
             RNS.log("Invalid bandwidth configured for " + str(self), RNS.LOG_ERROR)
             validcfg = False
