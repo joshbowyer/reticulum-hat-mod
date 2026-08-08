@@ -1071,11 +1071,35 @@ class SX126xRadio:
                 # with an IRQ status from a previous operation.
                 # (libgpiod v2.x: wait_edge_events(timeout) + read_edge_events();
                 # timeout=0 is the non-blocking "is anything pending?" check.)
+                #
+                # IMPORTANT: this drain must not blindly discard a GENUINE
+                # pending event as if it were stale backlog. The chip's own
+                # IRQ status bits latch DIO1 high until explicitly cleared
+                # via ClearIrqStatus - if we discard the kernel-level edge
+                # notification here without ever reading/clearing the chip's
+                # status for it, DIO1 stays physically high forever and no
+                # future rising edge can ever be detected again: every
+                # subsequent call drains nothing (already consumed), waits
+                # for a "new" edge that will never come, and times out -
+                # forever, silently. This exact permanent-deafness mechanism
+                # was found live: Lyra never received a single packet all
+                # session despite a confirmed-good transmitter, and DIO1 was
+                # once caught stuck HIGH for 10+ seconds while the daemon was
+                # running normally. Fix: if the drain loop finds ANYTHING
+                # pending, treat it as real and check chip status immediately
+                # instead of discarding it and moving on to wait for a new
+                # edge.
+                drained_any = False
                 while self._line_irq.wait_edge_events(0):
+                    drained_any = True
                     try:
                         self._line_irq.read_edge_events()
                     except Exception:
                         break
+                if drained_any:
+                    irq = self.get_irq_status()
+                    if irq != 0:
+                        return irq
                 # Edge-wait path — blocks in the kernel until the line fires.
                 remaining = deadline - time.monotonic()
                 if remaining < 0:
