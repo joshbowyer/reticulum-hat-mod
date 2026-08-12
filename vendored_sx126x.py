@@ -1183,28 +1183,28 @@ class SX126xRadio:
         elif tx_power_dbm >= 10 and version == TX_POWER_SX1268:
             pa_duty_cycle, hp_max, power = 0x00, 0x03, 0x0F
         else:
-            # Below the lowest supported value (SX1262: 14 dBm,
-            # SX1261/SX1268: 10 dBm). SX126x datasheet doesn't list a valid
-            # SetTxParams + SetPaConfig pair for these values — calling it
-            # with an inconsistent state (e.g. paDutyCycle=0 with a non-zero
-            # power register) causes the chip to reject the next SetTx with
-            # "command execution failed" (status 0x2a). Clamp UP to the
-            # lowest supported value rather than silently doing nothing —
-            # silently doing nothing would mean the chip retains its
-            # post-reset default (22 dBm) and the user has no idea their
-            # request was ignored.
-            import warnings as _w
-            _w.warn(
-                "SX126x set_tx_power({} dBm) below minimum for this chip "
-                "variant; clamping to 14 dBm.".format(tx_power_dbm),
-                stacklevel=2,
-            )
-            # Re-run the resolution with the clamped value.
+            # Below the discrete high-power PA buckets used above.
+            # SX1262 HP PA supports -9..22 dBm via SetTxParams with the
+            # low HP PA config (RadioLib pattern). Do NOT clamp UP — that
+            # defeats board-level safety caps (e.g. station-g3
+            # txpower_max=7 keeps chip drive low so an external PA is not
+            # over-driven). Floor at datasheet minimum instead.
             if version == TX_POWER_SX1262:
-                tx_power_dbm = 14
+                if tx_power_dbm < -9:
+                    tx_power_dbm = -9
+                pa_duty_cycle, hp_max = 0x02, 0x02
+                power = tx_power_dbm & 0xFF
+            elif version == TX_POWER_SX1261:
+                if tx_power_dbm < -17:
+                    tx_power_dbm = -17
+                pa_duty_cycle, hp_max, device_sel = 0x01, 0x00, 0x01
+                power = tx_power_dbm & 0xFF
             else:
-                tx_power_dbm = 10
-            return self.set_tx_power(tx_power_dbm, version=version)
+                # SX1268: floor at -9 with mid PA config
+                if tx_power_dbm < -9:
+                    tx_power_dbm = -9
+                pa_duty_cycle, hp_max = 0x00, 0x03
+                power = tx_power_dbm & 0xFF
 
         self.set_pa_config(pa_duty_cycle, hp_max, device_sel, 0x01)
         self.set_tx_params(power, PA_RAMP_800U)
