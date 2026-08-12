@@ -685,6 +685,57 @@ print(f"[OK] Femtofox: gpiochip={inst_ff.gpiochip}, "
 inst_ff.detach()
 
 # -------------------------------------------------------------------------
+# Test 6b: profile-based resolution — BQ/Uniteng Station G3 (Pi Zero 2W
+# daughterboard path). NOT hardware-verified yet - this only asserts the
+# profile dict resolves to the pin mapping documented in its own comments
+# and in Reticulum-StationG3/HARDWARE-RECON.md, plus that the txpower_max
+# safety cap and txen/rxen polarity flags are wired through correctly.
+# -------------------------------------------------------------------------
+print("\n--- Test 6b: profile resolution (Station G3, Pi Zero 2W) ---")
+
+cfg_g3 = dict(cfg)
+cfg_g3["platform"]    = "raspberry-pi"
+cfg_g3["radio_board"] = "station-g3"
+cfg_g3.pop("pin_irq", None)
+
+inst_g3 = interface_class(FakeTransport(), cfg_g3)
+
+# Expected resolved (gpiochip, line) pairs for Station G3 on a Pi:
+#   header pin 15 (IRQ)   -> BCM22 -> gpiochip0 line 22
+#   header pin 18 (BUSY)  -> BCM24 -> gpiochip0 line 24
+#   header pin 36 (RESET) -> BCM16 -> gpiochip0 line 16
+#   header pin 11 (TXEN)  -> BCM17 -> gpiochip0 line 17 (PA enable)
+#   header pin 16 (RXEN)  -> BCM23 -> gpiochip0 line 23 (LNA enable)
+#   CS -1 -> native spidev HW CS, not a gpiochip line (like Femtofox's txen)
+assert inst_g3.gpiochip == "gpiochip0", f"gpiochip={inst_g3.gpiochip}"
+assert inst_g3.pin_lines["irq"]  == ("gpiochip0", 22), f"irq={inst_g3.pin_lines['irq']}"
+assert inst_g3.pin_lines["busy"] == ("gpiochip0", 24), f"busy={inst_g3.pin_lines['busy']}"
+assert inst_g3.pin_lines["reset"]== ("gpiochip0", 16), f"reset={inst_g3.pin_lines['reset']}"
+assert inst_g3.pin_lines["txen"] == ("gpiochip0", 17), f"txen={inst_g3.pin_lines['txen']}"
+assert inst_g3.pin_lines["rxen"] == ("gpiochip0", 23), f"rxen={inst_g3.pin_lines['rxen']}"
+assert inst_g3.pin_lines["cs"] is None, f"cs={inst_g3.pin_lines['cs']} (should be None, native SPI CE)"
+assert inst_g3.spi_bus == 0 and inst_g3.spi_cs == 0
+assert inst_g3.platform_name == "raspberry-pi"
+assert inst_g3.board_name == "station-g3"
+# Polarity: PA enable is active-HIGH, LNA enable is active-LOW (opposite of
+# the driver's historical default) — this is the whole reason the
+# txen_active_low/rxen_active_low fields exist.
+assert inst_g3.txen_active_low is False, f"txen_active_low={inst_g3.txen_active_low}"
+assert inst_g3.rxen_active_low is True, f"rxen_active_low={inst_g3.rxen_active_low}"
+# Safety cap: profile's txpower_max must be the conservative 7 dBm value,
+# and configuring a higher txpower must be clamped down to it.
+assert inst_g3.txpower_max == 7, f"txpower_max={inst_g3.txpower_max}"
+print(f"[OK] Station G3: gpiochip={inst_g3.gpiochip}, "
+      f"irq={inst_g3.pin_lines['irq']}, busy={inst_g3.pin_lines['busy']}, "
+      f"reset={inst_g3.pin_lines['reset']}, txen={inst_g3.pin_lines['txen']}, "
+      f"rxen={inst_g3.pin_lines['rxen']}, cs={inst_g3.pin_lines['cs']}, "
+      f"txen_active_low={inst_g3.txen_active_low}, "
+      f"rxen_active_low={inst_g3.rxen_active_low}, "
+      f"txpower_max={inst_g3.txpower_max}")
+
+inst_g3.detach()
+
+# -------------------------------------------------------------------------
 # Test 7: unknown platform / board names raise clear errors
 # -------------------------------------------------------------------------
 print("\n--- Test 7: unknown platform / board raise clear errors ---")

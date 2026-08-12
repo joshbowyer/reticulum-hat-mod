@@ -113,6 +113,45 @@ Edit `~/.reticulum/config` and add an interface block. If the file doesn't exist
     radio_board = femtofox-integrated-v1
 ```
 
+#### Profile-based config — BQ/Uniteng Station G3 (Pi Zero 2W daughterboard)
+
+**NOT YET hardware-verified** — pin mapping derived from BQ's published
+meshtasticd YAML, a live `pinctrl` dump, and rep-provided `pa_control.sh`
+/ `lna_control.sh` scripts. See
+[`Reticulum-StationG3/HARDWARE-RECON.md`](https://github.com/joshbowyer/Reticulum-StationG3/blob/main/HARDWARE-RECON.md)
+for the full derivation and the ESP32-S3 daughterboard path (same radio
+module/PA circuit) which **is** hardware-verified.
+
+Station G3's PA/LNA stage is gated by physical motherboard jumpers
+(PA-PL1, PA-PL2, LNA-P) regardless of which MCU daughterboard is fitted —
+these must be **OPEN/OPEN/OPEN** (PA Level 1) before power-on, matching
+the verified ESP32-S3 path. On top of the jumper-selected level, this
+daughterboard path additionally exposes software PA/LNA enable GPIOs
+(`txen`/`rxen` below) that must also be driven for TX/RX to work.
+
+```ini
+[interfaces]
+
+  [[Station G3 LoRa]]
+    type = SX126xInterface
+    interface_enabled = True
+    frequency = 915000000
+    bandwidth = 125000
+    spreadingfactor = 8
+    codingrate = 5
+    txpower = 7
+    # Profile selection
+    platform    = raspberry-pi
+    radio_board = station-g3
+    dio3_tcxo_voltage = 1.8
+```
+
+`txpower` is capped by the profile's `txpower_max = 7` (chip-level dBm) —
+a conservative safety ceiling until real hardware measurements are taken,
+by analogy with the ESP32-S3 path's own confirmed ~20 dB of PA gain on
+this same module. Do not raise `txpower_max` until conducted power is
+measured on this specific daughterboard path.
+
 #### Escape hatch — `radio_board = custom` (hand-wired boards)
 
 When you don't have a named profile, set `radio_board = custom` and provide
@@ -193,6 +232,18 @@ Or create a systemd service (see below).
 | GPS TX   | 14       | 8           |
 | GPS RX   | 15       | 10          |
 | GPS PPS  | 23       | 16          |
+
+### BQ/Uniteng Station G3 (Pi Zero 2W path) — NOT YET hardware-verified
+
+| Function | BCM GPIO | Physical Pin | Notes |
+|----------|----------|---------------|-------|
+| SPI MOSI/MISO/CLK | native SPI0 | 19/21/23 | |
+| CS (NSS) | — | — | native SPI0 CE0, not bit-banged (`header_pin_cs = -1`) |
+| RESET    | 16       | 36            | |
+| BUSY     | 24       | 18            | |
+| IRQ/DIO1 | 22       | 15            | |
+| TXEN (PA enable) | 17 | 11          | active-HIGH |
+| RXEN (LNA enable)| 23 | 16          | active-LOW  |
 
 ### Waveshare SX1262 LoRa HAT (for reference)
 
