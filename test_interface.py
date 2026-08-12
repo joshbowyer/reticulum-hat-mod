@@ -686,16 +686,15 @@ inst_ff.detach()
 
 # -------------------------------------------------------------------------
 # Test 6b: profile-based resolution — BQ/Uniteng Station G3 (Pi Zero 2W
-# daughterboard path). NOT hardware-verified yet - this only asserts the
-# profile dict resolves to the pin mapping documented in its own comments
-# and in Reticulum-StationG3/HARDWARE-RECON.md, plus that the txpower_max
-# safety cap and txen/rxen polarity flags are wired through correctly.
+# daughterboard path). Hardware-verified: bit-bang CS pin 24 + spi0-0cs.
+# Asserts pin map, polarity, logical txpower_max, and PA-curve mapping.
 # -------------------------------------------------------------------------
 print("\n--- Test 6b: profile resolution (Station G3, Pi Zero 2W) ---")
 
 cfg_g3 = dict(cfg)
 cfg_g3["platform"]    = "raspberry-pi"
 cfg_g3["radio_board"] = "station-g3"
+cfg_g3["txpower"]     = 22   # logical antenna dBm (PA curve maps → chip)
 cfg_g3.pop("pin_irq", None)
 
 inst_g3 = interface_class(FakeTransport(), cfg_g3)
@@ -724,16 +723,40 @@ assert inst_g3.board_name == "station-g3"
 # txen_active_low/rxen_active_low fields exist.
 assert inst_g3.txen_active_low is False, f"txen_active_low={inst_g3.txen_active_low}"
 assert inst_g3.rxen_active_low is True, f"rxen_active_low={inst_g3.rxen_active_low}"
-# Safety cap: profile's txpower_max must be the conservative 7 dBm value,
-# and configuring a higher txpower must be clamped down to it.
-assert inst_g3.txpower_max == 7, f"txpower_max={inst_g3.txpower_max}"
+# With pa_curve: txpower/txpower_max are LOGICAL antenna dBm. Default safety
+# ceiling is 22 dBm out (≈ chip 8 on vendor L1@915). Mapping uses min chip
+# whose PA out ≥ target (no ESP32 index-offset bug).
+assert inst_g3.txpower_max == 22, f"txpower_max={inst_g3.txpower_max}"
+assert inst_g3.pa_curve is not None and len(inst_g3.pa_curve) >= 20
+assert inst_g3.txpower == 22, f"txpower={inst_g3.txpower}"
+assert inst_g3.chip_txpower == 8, f"chip_txpower={inst_g3.chip_txpower} (22 antenna → chip 8)"
+map_logical_txpower_to_chip = interface_globals["map_logical_txpower_to_chip"]
+assert map_logical_txpower_to_chip(27, inst_g3.pa_curve) == 14
+assert map_logical_txpower_to_chip(30, inst_g3.pa_curve) == 18
+assert map_logical_txpower_to_chip(32, inst_g3.pa_curve) == 21
+# Safety clamp: logical above txpower_max is capped before mapping
+cfg_g3_hi = dict(cfg_g3)
+cfg_g3_hi["txpower"] = 30  # above default max 22 → clamp to 22 → chip 8
+inst_g3_hi = interface_class(FakeTransport(), cfg_g3_hi)
+assert inst_g3_hi.txpower == 22, f"clamped txpower={inst_g3_hi.txpower}"
+assert inst_g3_hi.chip_txpower == 8, f"clamped chip={inst_g3_hi.chip_txpower}"
+inst_g3_hi.detach()
+# Override txpower_max to allow higher logical targets
+cfg_g3_ov = dict(cfg_g3)
+cfg_g3_ov["txpower"] = 32
+cfg_g3_ov["txpower_max"] = 32
+inst_g3_ov = interface_class(FakeTransport(), cfg_g3_ov)
+assert inst_g3_ov.txpower == 32
+assert inst_g3_ov.chip_txpower == 21, f"32 antenna → chip {inst_g3_ov.chip_txpower}"
+inst_g3_ov.detach()
 print(f"[OK] Station G3: gpiochip={inst_g3.gpiochip}, "
       f"irq={inst_g3.pin_lines['irq']}, busy={inst_g3.pin_lines['busy']}, "
       f"reset={inst_g3.pin_lines['reset']}, txen={inst_g3.pin_lines['txen']}, "
       f"rxen={inst_g3.pin_lines['rxen']}, cs={inst_g3.pin_lines['cs']}, "
       f"txen_active_low={inst_g3.txen_active_low}, "
       f"rxen_active_low={inst_g3.rxen_active_low}, "
-      f"txpower_max={inst_g3.txpower_max}")
+      f"txpower_max={inst_g3.txpower_max}, "
+      f"txpower={inst_g3.txpower}→chip {inst_g3.chip_txpower}")
 
 inst_g3.detach()
 

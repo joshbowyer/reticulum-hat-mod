@@ -401,9 +401,22 @@ BOARD_PROFILES = {
         "dio2_rf_switch":    True,
         "dio3_tcxo_voltage": 1.8,   # same BQ35LORA900V1M module as ESP32 path
         "tcxo_delay_ms":     5.0,
-        # SAFETY CAP until Pi-path PA curve is measured. ESP32 path used
-        # chip-level ~7 dBm for ~27 dBm actual under Level-1 jumpers OPEN.
-        "txpower_max":       7,
+        # With pa_curve present, txpower / txpower_max are LOGICAL antenna
+        # dBm (post-PA), not SX1262 chip dBm. Default ceiling 22 dBm out ≈
+        # chip ~8 dBm on the vendor L1@915 table — keeps external PA drive
+        # modest. Override txpower_max (up to ~33) only when intentionally
+        # testing higher conducted power with Level-1 jumpers OPEN.
+        "txpower_max":       22,
+        # BQ35LORA900V1M Level-1 conduction @915 MHz (vendor table, ±2 dB).
+        # Tuples are (chip_dBm, PA_out_dBm). Used to map logical antenna
+        # target → minimum chip dBm that achieves ≥ target out.
+        "pa_curve": (
+            (2, 16.6), (3, 17.6), (4, 18.7), (5, 19.7), (6, 20.7),
+            (7, 21.7), (8, 22.6), (9, 23.6), (10, 24.4), (11, 25.3),
+            (12, 26.1), (13, 26.9), (14, 27.7), (15, 28.4), (16, 29.2),
+            (17, 29.8), (18, 30.5), (19, 31.1), (20, 31.7), (21, 32.3),
+            (22, 32.8),
+        ),
         "rx_boosted_gain":   True,
         "profile_notes": (
             "BQ/Uniteng Station G3, Raspberry Pi Zero 2W daughterboard, "
@@ -413,7 +426,9 @@ BOARD_PROFILES = {
             "`dtparam=spi=on` and `dtoverlay=spi0-0cs` in "
             "/boot/firmware/config.txt so GPIO8 is free for libgpiod. "
             "PA-PL1/PA-PL2/LNA-P jumpers must stay OPEN (Level 1) plus "
-            "software txen/rxen. See Reticulum-StationG3/HARDWARE-RECON.md."
+            "software txen/rxen. txpower is logical antenna dBm via "
+            "vendor L1@915 PA curve (chip drive derived). "
+            "See Reticulum-StationG3/HARDWARE-RECON.md."
         ),
     },
 
@@ -452,6 +467,42 @@ _PIN_FIELDS = ("cs", "irq", "busy", "reset", "txen", "rxen")
 # Special board name that triggers the escape hatch.
 _CUSTOM_BOARD_NAME = "custom"
 
+# SX1262 chip TX power hard limits (dBm) for set_tx_power().
+_CHIP_TXPOWER_MIN = -9
+_CHIP_TXPOWER_MAX = 22
+
+
+def map_logical_txpower_to_chip(target_dbm, pa_curve):
+    """Map logical antenna/output dBm → minimum SX126x chip dBm via PA curve.
+
+    ``pa_curve`` is an iterable of ``(chip_dBm, pa_out_dBm)`` sorted by
+    ascending chip power (vendor conduction table). Returns the lowest chip
+    setting whose measured PA out is ≥ ``target_dbm``. Targets below the
+    curve floor use the lowest chip entry; targets above the ceiling use the
+    highest. Does **not** copy the ESP32 RNode index-offset bug.
+    """
+    if not pa_curve:
+        raise ValueError("pa_curve must be a non-empty sequence of (chip, pa_out)")
+    curve = list(pa_curve)
+    # Ensure ascending chip order
+    curve.sort(key=lambda p: p[0])
+    target = float(target_dbm)
+    for chip_dbm, pa_out in curve:
+        if float(pa_out) >= target:
+            chip = int(chip_dbm)
+            if chip < _CHIP_TXPOWER_MIN:
+                return _CHIP_TXPOWER_MIN
+            if chip > _CHIP_TXPOWER_MAX:
+                return _CHIP_TXPOWER_MAX
+            return chip
+    # Above curve ceiling — max chip entry
+    chip = int(curve[-1][0])
+    if chip < _CHIP_TXPOWER_MIN:
+        return _CHIP_TXPOWER_MIN
+    if chip > _CHIP_TXPOWER_MAX:
+        return _CHIP_TXPOWER_MAX
+    return chip
+
 
 class _ProfileResolutionError(ValueError):
     """Raised for any error in platform/board profile resolution."""
@@ -469,6 +520,9 @@ class _ProfileResolver:
         pin_lines: {pin_field_name: (gpiochip, line_offset) | None}
         dio2_rf_switch, dio3_tcxo_voltage, tcxo_delay_ms
         rx_boosted_gain, txpower_max
+        pa_curve: tuple of (chip_dBm, pa_out_dBm) or None
+                  When set, config txpower/txpower_max are logical antenna
+                  dBm and are mapped to chip dBm before set_tx_power().
         overrides_used: list of (key, profile_value, override_value)
         used_profile_mode: True if the profile system was used, False if
                           the legacy direct-gpiochip-line mode was used
@@ -749,6 +803,11 @@ class _ProfileResolver:
         tcxo_delay_ms     = self._float_or(board.get("tcxo_delay_ms", 5.0), 5.0)
         txpower_max       = self._int_or(board.get("txpower_max", 22), 22)
         rx_boosted_gain   = self._bool_or(board.get("rx_boosted_gain", True), True)
+        # Optional PA conduction curve: (chip_dBm, pa_out_dBm) tuples.
+        # When present, config txpower is logical antenna dBm.
+        pa_curve          = board.get("pa_curve", None)
+        if pa_curve is not None:
+            pa_curve = tuple((int(c), float(p)) for c, p in pa_curve)
         # Polarity of the external TXEN/RXEN "enabled" state. Almost every
         # board so far is active-HIGH for both (the historical assumption
         # baked into the driver), but the Station G3's LNA-enable pin is
@@ -795,6 +854,7 @@ class _ProfileResolver:
             "dio3_tcxo_voltage": dio3_tcxo_voltage,
             "tcxo_delay_ms":     tcxo_delay_ms,
             "txpower_max":       txpower_max,
+            "pa_curve":          pa_curve,
             "rx_boosted_gain":   rx_boosted_gain,
             "txen_active_low":   txen_active_low,
             "rxen_active_low":   rxen_active_low,
@@ -849,6 +909,7 @@ class _ProfileResolver:
             "dio3_tcxo_voltage": dio3_tcxo_voltage,
             "tcxo_delay_ms":     tcxo_delay_ms,
             "txpower_max":       txpower_max,
+            "pa_curve":          None,
             "rx_boosted_gain":   rx_boosted_gain,
             "overrides_used":    [],   # custom mode has no profile to override
         }
@@ -910,6 +971,7 @@ class _ProfileResolver:
             "dio3_tcxo_voltage": dio3_tcxo_voltage,
             "tcxo_delay_ms":     tcxo_delay_ms,
             "txpower_max":       txpower_max,
+            "pa_curve":          None,
             "rx_boosted_gain":   rx_boosted_gain,
             "overrides_used":    [],
         }
@@ -1014,6 +1076,7 @@ class SX126xInterface(Interface):
         self.dio3_tcxo_voltage = resolution["dio3_tcxo_voltage"]
         self.tcxo_delay_ms     = resolution["tcxo_delay_ms"]
         self.txpower_max       = resolution["txpower_max"]
+        self.pa_curve          = resolution.get("pa_curve", None)
         self.rx_boosted_gain   = resolution["rx_boosted_gain"]
         self.txen_active_low   = resolution.get("txen_active_low", False)
         self.rxen_active_low   = resolution.get("rxen_active_low", False)
@@ -1073,7 +1136,14 @@ class SX126xInterface(Interface):
         RNS.log("  dio2_rf_switch    : " + str(self.dio2_rf_switch), RNS.LOG_VERBOSE)
         RNS.log("  dio3_tcxo_voltage : " + str(self.dio3_tcxo_voltage) + " V", RNS.LOG_VERBOSE)
         RNS.log("  tcxo_delay_ms     : " + str(self.tcxo_delay_ms), RNS.LOG_VERBOSE)
-        RNS.log("  txpower_max       : " + str(self.txpower_max) + " dBm", RNS.LOG_VERBOSE)
+        if self.pa_curve:
+            RNS.log("  txpower_max       : " + str(self.txpower_max)
+                    + " dBm (logical antenna, PA curve)", RNS.LOG_VERBOSE)
+            RNS.log("  pa_curve          : " + str(len(self.pa_curve))
+                    + " points (chip→PA out)", RNS.LOG_VERBOSE)
+        else:
+            RNS.log("  txpower_max       : " + str(self.txpower_max)
+                    + " dBm (chip-level)", RNS.LOG_VERBOSE)
         RNS.log("  rx_boosted_gain   : " + str(self.rx_boosted_gain), RNS.LOG_VERBOSE)
 
         # Log any per-key overrides the user specified
@@ -1191,9 +1261,21 @@ class SX126xInterface(Interface):
         if frequency < SX126xInterface.FREQ_MIN or frequency > SX126xInterface.FREQ_MAX:
             RNS.log("Invalid frequency configured for " + str(self), RNS.LOG_ERROR)
             validcfg = False
-        if txpower < -9 or txpower > 22:
-            RNS.log("Invalid TX power configured for " + str(self), RNS.LOG_ERROR)
-            validcfg = False
+        # TX power units depend on whether the board profile has a PA curve:
+        #   with pa_curve  → config txpower / txpower_max are LOGICAL antenna dBm
+        #   without        → chip-level SX1262 dBm (-9..22)
+        if self.pa_curve:
+            # Logical antenna range: allow below curve floor (maps to min chip)
+            # up through curve ceiling + small margin; reject absurd values.
+            max_logical = max(int(round(p[1])) for p in self.pa_curve) + 1
+            if txpower < 0 or txpower > max(max_logical, self.txpower_max + 1):
+                RNS.log("Invalid TX power configured for " + str(self)
+                        + " (logical antenna dBm out of range)", RNS.LOG_ERROR)
+                validcfg = False
+        else:
+            if txpower < _CHIP_TXPOWER_MIN or txpower > _CHIP_TXPOWER_MAX:
+                RNS.log("Invalid TX power configured for " + str(self), RNS.LOG_ERROR)
+                validcfg = False
         # Enforce the resolved board profile's txpower_max as a hard ceiling,
         # not just an informational value (previously only logged, never
         # actually checked against the user-configured txpower - a real gap,
@@ -1211,6 +1293,14 @@ class SX126xInterface(Interface):
                     str(self.txpower_max) + " dBm", RNS.LOG_WARNING)
             txpower = self.txpower_max
             self.txpower = txpower
+        # Derive chip-level drive from PA curve (or pass-through chip dBm).
+        if self.pa_curve:
+            self.chip_txpower = map_logical_txpower_to_chip(self.txpower, self.pa_curve)
+            RNS.log(str(self) + " PA curve: logical " + str(self.txpower)
+                    + " dBm antenna → chip " + str(self.chip_txpower) + " dBm",
+                    RNS.LOG_NOTICE)
+        else:
+            self.chip_txpower = int(self.txpower)
         if bandwidth not in [7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000]:
             RNS.log("Invalid bandwidth configured for " + str(self), RNS.LOG_ERROR)
             validcfg = False
@@ -1301,8 +1391,8 @@ class SX126xInterface(Interface):
         # Carrier frequency
         self.radio.set_frequency(self.frequency)
 
-        # TX power (SX1262 variant)
-        self.radio.set_tx_power(self.txpower, vd.TX_POWER_SX1262)
+        # TX power (SX1262 variant) — chip dBm (PA-mapped when pa_curve set)
+        self.radio.set_tx_power(self.chip_txpower, vd.TX_POWER_SX1262)
 
         # RX gain: profile-controlled. Default is boosted for best sensitivity.
         if self.rx_boosted_gain:
@@ -1385,7 +1475,7 @@ class SX126xInterface(Interface):
             self.radio.set_dio2_as_rf_switch_ctrl(self.dio2_rf_switch)
             self.radio.set_regulator_mode(vd.REGULATOR_DC_DC)
             self.radio.set_frequency(self.frequency)
-            self.radio.set_tx_power(self.txpower, vd.TX_POWER_SX1262)
+            self.radio.set_tx_power(self.chip_txpower, vd.TX_POWER_SX1262)
             if self.rx_boosted_gain:
                 self.radio.set_rx_gain(vd.RX_GAIN_BOOSTED)
             else:

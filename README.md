@@ -139,18 +139,24 @@ daughterboard path additionally exposes software PA/LNA enable GPIOs
     interface_enabled = True
     frequency = 915000000
     bandwidth = 125000
-    spreadingfactor = 8
+    spreadingfactor = 7
     codingrate = 5
-    txpower = 7
+    # LOGICAL antenna dBm (post-PA). Profile maps via vendor L1@915 curve
+    # to SX1262 chip dBm (e.g. 22 out → chip ~8). Default txpower_max=22.
+    txpower = 22
     # Profile selection
     platform    = raspberry-pi
     radio_board = station-g3
     dio3_tcxo_voltage = 1.8
 ```
 
-`txpower` is capped by the profile's `txpower_max = 7` (chip-level dBm) —
-a conservative safety ceiling until Pi-path PA gain is measured. Do not
-raise `txpower_max` until conducted power is measured on this path.
+With `pa_curve` on this board, `txpower` / `txpower_max` are **logical
+antenna dBm** (post external PA), not raw SX1262 chip dBm. The driver
+picks the minimum chip setting whose vendor L1@915 PA out is ≥ the
+target (e.g. 22→8, 27→14, 30→18, 32→21). Default `txpower_max = 22`
+keeps PA drive modest (~chip 8). To test higher conducted power with
+Level-1 jumpers OPEN, override both, e.g. `txpower = 32` and
+`txpower_max = 32`. Chip drive is always clamped to −9…22 dBm.
 
 #### Escape hatch — `radio_board = custom` (hand-wired boards)
 
