@@ -598,11 +598,16 @@ class SX126xRadio:
 
         # --- Sanity check: chip responds to SetStandby + GetStatus ---
         self.set_standby(STANDBY_RC)
-        if self.get_status_and_mode() != STATUS_MODE_STDBY_RC:
+        status_and_mode = self.get_status_and_mode()
+        if status_and_mode != STATUS_MODE_STDBY_RC:
+            # Cache the status BEFORE close() releases the GPIO lines --
+            # calling get_status_and_mode() again afterwards would try to
+            # read the (now-released) BUSY line and raise a confusing
+            # AttributeError that masks this more informative error.
             self.close()
             raise SX126xError(
                 "SX126x not responding after reset (status=0x{:02x})".format(
-                    self.get_status_and_mode()))
+                    status_and_mode))
 
         self.set_packet_type(PACKET_TYPE_LORA)
         self._fix_resistance_antenna()
