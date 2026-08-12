@@ -115,12 +115,14 @@ Edit `~/.reticulum/config` and add an interface block. If the file doesn't exist
 
 #### Profile-based config — BQ/Uniteng Station G3 (Pi Zero 2W daughterboard)
 
-**NOT YET hardware-verified** — pin mapping derived from BQ's published
-meshtasticd YAML, a live `pinctrl` dump, and rep-provided `pa_control.sh`
-/ `lna_control.sh` scripts. See
-[`Reticulum-StationG3/HARDWARE-RECON.md`](https://github.com/joshbowyer/Reticulum-StationG3/blob/main/HARDWARE-RECON.md)
-for the full derivation and the ESP32-S3 daughterboard path (same radio
-module/PA circuit) which **is** hardware-verified.
+**Hardware-verified** (2026-08-12): SPI talk-up works with bit-banged NSS.
+Same Primary RF Slot also verified under ESP32-S3 RNode firmware.
+
+**Critical SPI note:** hardware SPI0 CE0 does **not** chip-select the
+SX126x on this board (GetStatus always `0x00`). NSS must be bit-banged on
+physical pin 24 (BCM8). Use `dtoverlay=spi0-0cs` in
+`/boot/firmware/config.txt` so GPIO8 is free for libgpiod (`spi0-1cs`
+claims CE0 and blocks bit-bang).
 
 Station G3's PA/LNA stage is gated by physical motherboard jumpers
 (PA-PL1, PA-PL2, LNA-P) regardless of which MCU daughterboard is fitted —
@@ -147,10 +149,8 @@ daughterboard path additionally exposes software PA/LNA enable GPIOs
 ```
 
 `txpower` is capped by the profile's `txpower_max = 7` (chip-level dBm) —
-a conservative safety ceiling until real hardware measurements are taken,
-by analogy with the ESP32-S3 path's own confirmed ~20 dB of PA gain on
-this same module. Do not raise `txpower_max` until conducted power is
-measured on this specific daughterboard path.
+a conservative safety ceiling until Pi-path PA gain is measured. Do not
+raise `txpower_max` until conducted power is measured on this path.
 
 #### Escape hatch — `radio_board = custom` (hand-wired boards)
 
@@ -233,12 +233,14 @@ Or create a systemd service (see below).
 | GPS RX   | 15       | 10          |
 | GPS PPS  | 23       | 16          |
 
-### BQ/Uniteng Station G3 (Pi Zero 2W path) — NOT YET hardware-verified
+### BQ/Uniteng Station G3 (Pi Zero 2W path) — hardware-verified
+
+Requires `dtoverlay=spi0-0cs` (not `spi0-1cs`) so NSS can be bit-banged.
 
 | Function | BCM GPIO | Physical Pin | Notes |
 |----------|----------|---------------|-------|
 | SPI MOSI/MISO/CLK | native SPI0 | 19/21/23 | |
-| CS (NSS) | — | — | native SPI0 CE0, not bit-banged (`header_pin_cs = -1`) |
+| CS (NSS) | 8        | 24            | **bit-banged** (`header_pin_cs = 24`); HW CE0 does not work |
 | RESET    | 16       | 36            | |
 | BUSY     | 24       | 18            | |
 | IRQ/DIO1 | 22       | 15            | |

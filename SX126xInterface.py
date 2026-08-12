@@ -237,6 +237,9 @@ PLATFORM_PROFILES = {
             16: ("gpiochip0", 23),   # physical 16 = BCM23
             18: ("gpiochip0", 24),   # physical 18 = BCM24
             22: ("gpiochip0", 25),   # physical 22 = BCM25
+            24: ("gpiochip0",  8),   # physical 24 = BCM8   (Station G3 NSS —
+                                      # bit-banged; HW SPI0 CE0 does not select
+                                      # the SX126x on this board)
             29: ("gpiochip0",  5),   # physical 29 = BCM5
             31: ("gpiochip0",  6),   # physical 31 = BCM6
             32: ("gpiochip0", 12),   # physical 32 = BCM12  (MeshAdv RXEN)
@@ -374,75 +377,43 @@ BOARD_PROFILES = {
         "board_name":        "station-g3",
         "profile_version":   1,
         # BQ/Uniteng Station G3 devkit, Raspberry Pi Zero 2W MCU
-        # daughterboard path, Primary RF Slot (populated by default with
-        # the BQ35LORA900V1M SX1262 module). NOT YET hardware-verified -
-        # derived from BQ's own published meshtasticd YAML example config,
-        # a live `pinctrl get 7-25` dump from BQ's own test rig, and
-        # rep-provided lna_control.sh/pa_control.sh scripts. See
-        # Reticulum-StationG3/HARDWARE-RECON.md for the full derivation.
-        "header_pin_cs":     -1,   # SPI0 CE0 (BCM8/physical 24) - native
-                                   # spidev hardware CS, not bit-banged.
-        "header_pin_irq":    15,  # physical pin 15 -> BCM22 (DIO1/IRQ,
-                                   # per BQ's meshtasticd config: IRQ: 22)
-        "header_pin_busy":   18,  # physical pin 18 -> BCM24 (BUSY,
-                                   # per BQ's meshtasticd config: Busy: 24)
-        "header_pin_reset":  36,  # physical pin 36 -> BCM16 (RESET,
-                                   # per BQ's meshtasticd config: Reset: 16)
-        "header_pin_txen":   11,  # physical pin 11 -> BCM17 = PA enable.
-                                   # Rep-confirmed "pin 11 PA Mode"; matches
-                                   # pa_control.sh's GPIO_PIN=17 exactly.
-                                   # Active-HIGH (PAHIGH -> gpioset ...=1),
-                                   # matching the driver's existing txen
-                                   # assumption - no polarity flag needed.
-        "header_pin_rxen":   16,  # physical pin 16 -> BCM23 = LNA enable.
-                                   # Rep-confirmed "pin 16 Primary Slot LNA
-                                   # Mode"; matches lna_control.sh's
-                                   # GPIO_PIN=23 exactly. Active-LOW
-                                   # (LNAON -> gpioset ...=0) - OPPOSITE of
-                                   # the driver's historical rxen
-                                   # assumption, hence rxen_active_low.
+        # daughterboard path, Primary RF Slot (BQ35LORA900V1M SX1262).
+        # Hardware-verified 2026-08-12 on a live Pi Zero 2W + G3 unit:
+        # spidev hardware CE0 does NOT select the SX126x (GetStatus always
+        # 0x00). Bit-banged NSS on physical pin 24 (BCM8) works — GetStatus
+        # returns 0xA2 (STDBY_RC). Same RF slot works under ESP32-S3 RNode
+        # firmware, so the fault was Pi CS path only. Use dtoverlay=spi0-0cs
+        # so GPIO8 is free for libgpiod (spi0-1cs claims CE0 and blocks it).
+        "header_pin_cs":     24,  # physical pin 24 -> BCM8 (Primary Slot NSS)
+                                   # BIT-BANGED — HW SPI0 CE0 does not work on
+                                   # this board (verified). Requires spi0-0cs.
+        "header_pin_irq":    15,  # physical pin 15 -> BCM22 (DIO1/IRQ)
+        "header_pin_busy":   18,  # physical pin 18 -> BCM24 (BUSY)
+        "header_pin_reset":  36,  # physical pin 36 -> BCM16 (RESET)
+        "header_pin_txen":   11,  # physical pin 11 -> BCM17 = PA enable
+                                   # Active-HIGH (pa_control.sh GPIO_PIN=17)
+        "header_pin_rxen":   16,  # physical pin 16 -> BCM23 = LNA enable
+                                   # Active-LOW (lna_control.sh GPIO_PIN=23)
         "txen_active_low":   False,
         "rxen_active_low":   True,
         "spi_bus":           0,
-        "spi_cs":            0,
+        "spi_cs":            0,   # spidev node index only; NSS is pin_cs
         "dio2_rf_switch":    True,
-        "dio3_tcxo_voltage": 1.8,   # ASSUMED by analogy with the ESP32-S3
-                                    # daughterboard path's confirmed spec
-                                    # (same BQ35LORA900V1M RF module either
-                                    # way) - not independently confirmed
-                                    # for the RPi path's exact YAML value.
+        "dio3_tcxo_voltage": 1.8,   # same BQ35LORA900V1M module as ESP32 path
         "tcxo_delay_ms":     5.0,
-        # SAFETY CAP, not yet a calibrated limit: capped low (chip-level 7dBm,
-        # not the chip's real max of 22dBm) to keep actual RF output (after
-        # the external PA) comfortably under Station G3's documented ~2W
-        # false-OVP-trip threshold (see Reticulum-StationG3/HARDWARE-RECON.md)
-        # until real hardware arrives and the PA gain curve for THIS specific
-        # RPi-Zero-2W daughterboard path can be measured. Basis: the ESP32-S3
-        # daughterboard path's own reference config uses chip-level 7dBm to
-        # reach ~27dBm/0.5W actual (implying ~20dB of PA gain on this same
-        # BQ35LORA900V1M module) - reusing that same chip-level value here
-        # gives an actual-output estimate safely under the 1W/30dBm target
-        # even if this path's PA gain turns out somewhat higher than assumed.
-        # This value is NOT currently enforced automatically elsewhere in this
-        # file for other profiles (txpower_max was previously informational
-        # only) - see the new hard-cap check added in __init__ below, which
-        # now clamps user-configured `txpower` to this profile's txpower_max
-        # for every board, not just this one.
+        # SAFETY CAP until Pi-path PA curve is measured. ESP32 path used
+        # chip-level ~7 dBm for ~27 dBm actual under Level-1 jumpers OPEN.
         "txpower_max":       7,
         "rx_boosted_gain":   True,
         "profile_notes": (
             "BQ/Uniteng Station G3, Raspberry Pi Zero 2W daughterboard, "
-            "Primary RF Slot (BQ35LORA900V1M / SX1262). NOT YET hardware-"
-            "verified - pin mapping derived from BQ's own published docs "
-            "and scripts, not confirmed on a physical board. Requires "
-            "`dtparam=i2c_arm=on`, `dtoverlay=spi0-1cs`, "
-            "`dtoverlay=spi1-1cs` in /boot/firmware/config.txt per BQ's "
-            "own troubleshooting notes. Station G3 adds software-"
-            "controllable PA/LNA enable GPIOs over Station G2, which only "
-            "has physical jumpers for this - the underlying LoRa/SPI "
-            "pinout is otherwise identical between G2 and G3 (rep-"
-            "confirmed firmware compatibility). See "
-            "Reticulum-StationG3/HARDWARE-RECON.md for the full recon."
+            "Primary RF Slot (BQ35LORA900V1M / SX1262). SPI NSS must be "
+            "bit-banged on header pin 24 (BCM8): hardware SPI0 CE0 does "
+            "not chip-select the radio (live-verified). Requires "
+            "`dtparam=spi=on` and `dtoverlay=spi0-0cs` in "
+            "/boot/firmware/config.txt so GPIO8 is free for libgpiod. "
+            "PA-PL1/PA-PL2/LNA-P jumpers must stay OPEN (Level 1) plus "
+            "software txen/rxen. See Reticulum-StationG3/HARDWARE-RECON.md."
         ),
     },
 

@@ -706,14 +706,16 @@ inst_g3 = interface_class(FakeTransport(), cfg_g3)
 #   header pin 36 (RESET) -> BCM16 -> gpiochip0 line 16
 #   header pin 11 (TXEN)  -> BCM17 -> gpiochip0 line 17 (PA enable)
 #   header pin 16 (RXEN)  -> BCM23 -> gpiochip0 line 23 (LNA enable)
-#   CS -1 -> native spidev HW CS, not a gpiochip line (like Femtofox's txen)
+#   header pin 24 (CS)    -> BCM8  -> gpiochip0 line 8  (bit-banged NSS;
+#                             HW SPI0 CE0 does not select the SX126x)
 assert inst_g3.gpiochip == "gpiochip0", f"gpiochip={inst_g3.gpiochip}"
 assert inst_g3.pin_lines["irq"]  == ("gpiochip0", 22), f"irq={inst_g3.pin_lines['irq']}"
 assert inst_g3.pin_lines["busy"] == ("gpiochip0", 24), f"busy={inst_g3.pin_lines['busy']}"
 assert inst_g3.pin_lines["reset"]== ("gpiochip0", 16), f"reset={inst_g3.pin_lines['reset']}"
 assert inst_g3.pin_lines["txen"] == ("gpiochip0", 17), f"txen={inst_g3.pin_lines['txen']}"
 assert inst_g3.pin_lines["rxen"] == ("gpiochip0", 23), f"rxen={inst_g3.pin_lines['rxen']}"
-assert inst_g3.pin_lines["cs"] is None, f"cs={inst_g3.pin_lines['cs']} (should be None, native SPI CE)"
+assert inst_g3.pin_lines["cs"] == ("gpiochip0", 8), f"cs={inst_g3.pin_lines['cs']} (bit-bang BCM8)"
+assert inst_g3.pin_cs == 8, f"pin_cs={inst_g3.pin_cs}"
 assert inst_g3.spi_bus == 0 and inst_g3.spi_cs == 0
 assert inst_g3.platform_name == "raspberry-pi"
 assert inst_g3.board_name == "station-g3"
