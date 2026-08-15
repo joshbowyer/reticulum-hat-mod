@@ -253,6 +253,15 @@ Requires `dtoverlay=spi0-0cs` (not `spi0-1cs`) so NSS can be bit-banged.
 | TXEN (PA enable) | 17 | 11          | active-HIGH |
 | RXEN (LNA enable)| 23 | 16          | active-LOW  |
 
+**Pin 16 conflict (MeshAdv GPS PPS vs Station G3 RXEN):** both boards use
+physical pin 16, but in opposite directions (PPS input vs RXEN output). On
+Raspberry Pi this is usually just a software pin choice; on Luckfox Lyra Zero W
+the device-tree overlay must match the HAT. LoRaspbian ships two mutually
+exclusive overlays (`lyra-zero-w-pi-header` default MeshAdv+PPS,
+`lyra-zero-w-station-g3` for G3) and `lyra-hat-pinmux` (wizard +
+`reticulum-mesh-ctl start`) to switch them when `radio_board` / HAT config
+changes. Do not load both overlays at once.
+
 ### Waveshare SX1262 LoRa HAT (for reference)
 
 The Waveshare HAT uses a UART-based E22 module, **not** direct SPI. It is **not compatible** with this interface. Use the SerialInterface instead, or get a direct-SPI board.
