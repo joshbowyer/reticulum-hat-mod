@@ -33,6 +33,8 @@ class FakeSX126xRadio:
     IRQ_HEADER_ERR = 0x0020
     IRQ_CAD_DONE = 0x0080
     IRQ_CAD_DETECTED = 0x0100
+    IRQ_PREAMBLE_DETECTED = 0x0004
+    IRQ_SYNC_WORD_VALID = 0x0008
     HEADER_EXPLICIT = 0x00
     RX_GAIN_BOOSTED = 0x01
     REGULATOR_DC_DC = 0x01
@@ -40,6 +42,10 @@ class FakeSX126xRadio:
     STANDBY_RC = 0x00
     PACKET_TYPE_LORA = 0x01
     STATUS_MODE_STDBY_RC = 0x20
+    STATUS_MODE_STDBY_XOSC = 0x30
+    STATUS_MODE_FS = 0x40
+    STATUS_MODE_RX = 0x50
+    STATUS_MODE_TX = 0x60
     RX_CONTINUOUS = 0xFFFFFF
 
     # State
@@ -50,6 +56,7 @@ class FakeSX126xRadio:
         self.closed = False
         self.in_rx = False
         self.irq_pending = None
+        self._tx_pending = False
         # fail_next: when True, the next SPI/op raises. Consumed after one use.
         self.fail_next = False
         # fail_all_spi: when True, every SPI/op raises (until cleared).
@@ -138,6 +145,11 @@ class FakeSX126xRadio:
         # For CAD mode, return IRQ_CAD_DONE immediately (channel clear).
         if self._mode == "CAD":
             return FakeSX126xRadio.IRQ_CAD_DONE
+        # TX completes immediately with TX_DONE.
+        if self._mode == "TX" or self._tx_pending:
+            self._tx_pending = False
+            self._mode = "STDBY"
+            return FakeSX126xRadio.IRQ_TX_DONE
         # For RX mode, return None (timeout = no IRQ)
         time.sleep(min(timeout_s, 0.05))
         return None
@@ -164,9 +176,33 @@ class FakeSX126xRadio:
         self._maybe_fail()
         return bytes(n)
 
+    def get_irq_status(self):
+        self._maybe_fail()
+        if self._mode == "CAD":
+            return FakeSX126xRadio.IRQ_CAD_DONE
+        if self._mode == "TX" or self._tx_pending:
+            self._tx_pending = False
+            self._mode = "STDBY"
+            return FakeSX126xRadio.IRQ_TX_DONE
+        return 0
+
+    def get_status_byte(self):
+        self._maybe_fail()
+        if self._mode == "TX":
+            return FakeSX126xRadio.STATUS_MODE_TX
+        if self._mode == "RX":
+            return FakeSX126xRadio.STATUS_MODE_RX | 0x02
+        if self._mode == "CAD":
+            return FakeSX126xRadio.STATUS_MODE_STDBY_RC
+        return FakeSX126xRadio.STATUS_MODE_STDBY_RC | 0x02
+
+    def get_packet_type(self):
+        self._maybe_fail()
+        return FakeSX126xRadio.PACKET_TYPE_LORA
+
     def get_status_and_mode(self):
         self._maybe_fail()
-        return FakeSX126xRadio.STATUS_MODE_STDBY_RC
+        return self.get_status_byte() & 0x70
 
     @staticmethod
     def _tcxo_voltage_code(v):
@@ -190,6 +226,8 @@ fake_vd.IRQ_CRC_ERR          = FakeSX126xRadio.IRQ_CRC_ERR
 fake_vd.IRQ_HEADER_ERR       = FakeSX126xRadio.IRQ_HEADER_ERR
 fake_vd.IRQ_CAD_DONE         = FakeSX126xRadio.IRQ_CAD_DONE
 fake_vd.IRQ_CAD_DETECTED     = FakeSX126xRadio.IRQ_CAD_DETECTED
+fake_vd.IRQ_PREAMBLE_DETECTED = FakeSX126xRadio.IRQ_PREAMBLE_DETECTED
+fake_vd.IRQ_SYNC_WORD_VALID  = FakeSX126xRadio.IRQ_SYNC_WORD_VALID
 fake_vd.HEADER_EXPLICIT      = FakeSX126xRadio.HEADER_EXPLICIT
 fake_vd.RX_GAIN_BOOSTED      = FakeSX126xRadio.RX_GAIN_BOOSTED
 fake_vd.REGULATOR_DC_DC      = FakeSX126xRadio.REGULATOR_DC_DC
@@ -197,6 +235,10 @@ fake_vd.TX_POWER_SX1262      = FakeSX126xRadio.TX_POWER_SX1262
 fake_vd.STANDBY_RC           = FakeSX126xRadio.STANDBY_RC
 fake_vd.PACKET_TYPE_LORA     = FakeSX126xRadio.PACKET_TYPE_LORA
 fake_vd.STATUS_MODE_STDBY_RC = FakeSX126xRadio.STATUS_MODE_STDBY_RC
+fake_vd.STATUS_MODE_STDBY_XOSC = FakeSX126xRadio.STATUS_MODE_STDBY_XOSC
+fake_vd.STATUS_MODE_FS       = FakeSX126xRadio.STATUS_MODE_FS
+fake_vd.STATUS_MODE_RX       = FakeSX126xRadio.STATUS_MODE_RX
+fake_vd.STATUS_MODE_TX       = FakeSX126xRadio.STATUS_MODE_TX
 fake_vd.RX_CONTINUOUS        = FakeSX126xRadio.RX_CONTINUOUS
 sys.modules["vendored_sx126x"] = fake_vd
 
@@ -889,17 +931,17 @@ finally:
 # -------------------------------------------------------------------------
 # Test 11: preamble_length config key (interoperability with non-RNode
 # LoRa firmwares such as thatSFguy/reticulum-lora-repeater which use
-# a 16-symbol preamble). Default must be 8; override must flow through
-# to set_lora_packet and _calculate_toa.
+# a 16-symbol preamble). Default is RNode auto-tune (SF/BW/CR dependent,
+# floor 18); override must flow through to set_lora_packet and _calculate_toa.
 # -------------------------------------------------------------------------
 print("\n--- Test 11: preamble_length config key ---")
 
-# (a) default: no preamble_length in config -> 8
+# (a) default: no preamble_length in config -> RNode auto-tune (>=18)
 cfg_pl_default = dict(cfg)
 inst_pl_default = interface_class(FakeTransport(), cfg_pl_default)
-assert inst_pl_default.preamble_length == 8, \
-    f"default preamble_length should be 8, got {inst_pl_default.preamble_length}"
-print("[OK] default preamble_length == 8")
+assert inst_pl_default.preamble_length >= 18, \
+    f"default preamble_length should be RNode auto-tune >=18, got {inst_pl_default.preamble_length}"
+print(f"[OK] default preamble_length == {inst_pl_default.preamble_length} (RNode auto-tune)")
 
 # (b) override: preamble_length = 16 -> 16, and set_lora_packet sees it
 cfg_pl_16 = dict(cfg)
@@ -918,27 +960,33 @@ for call in inst_pl_16.radio.set_lora_packet_calls:
         f"every set_lora_packet call must use preamble_length=16, saw {preamble_arg} in args={call}"
 print(f"[OK] preamble_length=16 flows through to all {len(inst_pl_16.radio.set_lora_packet_calls)} set_lora_packet calls")
 
-# (c) invalid value (non-numeric) must fall back to 8, no error raised
+# (c) invalid value (non-numeric) must fall back to RNode auto-tune
 cfg_pl_bad = dict(cfg)
 cfg_pl_bad["preamble_length"] = "not-a-number"
 inst_pl_bad = interface_class(FakeTransport(), cfg_pl_bad)
-assert inst_pl_bad.preamble_length == 8, \
-    f"invalid preamble_length should default to 8, got {inst_pl_bad.preamble_length}"
-print("[OK] invalid preamble_length silently falls back to 8")
+assert inst_pl_bad.preamble_length >= 18, \
+    f"invalid preamble_length should fall back to RNode auto-tune >=18, got {inst_pl_bad.preamble_length}"
+print(f"[OK] invalid preamble_length silently falls back to {inst_pl_bad.preamble_length}")
 
-# (d) invalid value (zero / negative) must fall back to 8
+# (d) invalid value (zero / negative) must fall back to RNode auto-tune
 cfg_pl_zero = dict(cfg)
 cfg_pl_zero["preamble_length"] = "0"
 inst_pl_zero = interface_class(FakeTransport(), cfg_pl_zero)
-assert inst_pl_zero.preamble_length == 8, \
-    f"preamble_length=0 should default to 8, got {inst_pl_zero.preamble_length}"
-print("[OK] preamble_length=0 silently falls back to 8")
+assert inst_pl_zero.preamble_length >= 18, \
+    f"preamble_length=0 should fall back to RNode auto-tune >=18, got {inst_pl_zero.preamble_length}"
+print(f"[OK] preamble_length=0 silently falls back to {inst_pl_zero.preamble_length}")
 
 # (e) _calculate_toa must use the configured preamble_length
-#      8 symbols at SF8/BW125k: t_preamble = (8 + 4.25) * t_sym
-#     16 symbols at SF8/BW125k: t_preamble = (16 + 4.25) * t_sym
-toa_8  = inst_pl_default._calculate_toa(50)
+#     default auto-tune vs explicit 16 at same SF/BW
+toa_default = inst_pl_default._calculate_toa(50)
 toa_16 = inst_pl_16._calculate_toa(50)
+# default auto-tune is typically >=18, so toa_default should be >= toa_16
+# when default preamble >= 16; compare via explicit 8 override instead.
+cfg_pl_8 = dict(cfg)
+cfg_pl_8["preamble_length"] = "8"
+inst_pl_8 = interface_class(FakeTransport(), cfg_pl_8)
+assert inst_pl_8.preamble_length == 8
+toa_8 = inst_pl_8._calculate_toa(50)
 assert toa_16 > toa_8, \
     f"toa with preamble=16 ({toa_16}) should be greater than toa with preamble=8 ({toa_8})"
 expected_diff = (16 - 8) * ((2 ** 8) / 125000)
@@ -950,6 +998,8 @@ print(f"[OK] _calculate_toa honours preamble_length: toa_8={toa_8*1000:.2f}ms, "
 inst_pl_default.detach()
 inst_pl_16.detach()
 inst_pl_bad.detach()
+inst_pl_zero.detach()
+inst_pl_8.detach()
 inst_pl_zero.detach()
 
 print("\n*** ALL TESTS PASSED ***")

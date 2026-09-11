@@ -324,7 +324,7 @@ interface from starting with the bundled profiles.
 | `tcxo_delay_ms` | (from board) | TCXO warm-up delay in ms. |
 | `rx_boosted_gain` | (from board) | If true, use boosted RX gain register value. |
 | `sync_word` | 0x12 | LoRa sync word (0x12=private, 0x34=public) |
-| `csma_p` | 0.1 | CSMA transmit probability (0.0-1.0) |
+| `csma_p` | 0.5 | CSMA transmit probability (0.0-1.0); lower = more polite on busy channels |
 | `csma_slot_ms` | 50 | CSMA slot time in milliseconds |
 | `csma_max_backoff` | 5 | Max CSMA backoff exponent |
 | `airtime_limit_short` | (none) | Short-term airtime limit (%) |

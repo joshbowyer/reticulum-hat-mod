@@ -1203,8 +1203,11 @@ class SX126xInterface(Interface):
         else:
             preamble_length = _rnode_preamble_symbols(sf, bandwidth, cr)
 
-        # CSMA/CA parameters
-        self.csma_p           = float(c["csma_p"])         if "csma_p"         in c else 0.1
+        # CSMA/CA parameters.
+        # Default p=0.5 is a sparse-mesh compromise: prove-out used 1.0 (always
+        # TX when CAD clear); stock 0.1 was too polite once CAD became reliable
+        # and left nodes starving under modest announce load. Override in config.
+        self.csma_p           = float(c["csma_p"])         if "csma_p"         in c else 0.5
         self.csma_slot_ms     = float(c["csma_slot_ms"])   if "csma_slot_ms"   in c else 50.0
         self.csma_max_backoff = int(c["csma_max_backoff"]) if "csma_max_backoff" in c else 5
 
@@ -1235,6 +1238,8 @@ class SX126xInterface(Interface):
         self.r_stat_rssi = None
         self.r_stat_snr  = None
         self.announce_rate_target = None
+        self._cad_timeout_streak = 0
+        self._cad_n_symbols = 2
 
         # Radio hardware handle (set by _init_radio)
         self.radio = None
@@ -1388,8 +1393,16 @@ class SX126xInterface(Interface):
         # DC-DC regulator for better efficiency
         self.radio.set_regulator_mode(vd.REGULATOR_DC_DC)
 
-        # Carrier frequency
+        # open() re-asserts LoRa after TCXO calibrate, but be explicit before
+        # any LoRa-only commands (modulation / CAD / packet params).
+        self.radio.set_packet_type(vd.PACKET_TYPE_LORA)
+
+        # Carrier frequency (calibrate_image inside can drop packet type)
         self.radio.set_frequency(self.frequency)
+        if hasattr(self.radio, "_ensure_packet_type_lora"):
+            self.radio._ensure_packet_type_lora()
+        else:
+            self.radio.set_packet_type(vd.PACKET_TYPE_LORA)
 
         # TX power (SX1262 variant) — chip dBm (PA-mapped when pa_curve set)
         self.radio.set_tx_power(self.chip_txpower, vd.TX_POWER_SX1262)
@@ -1403,6 +1416,22 @@ class SX126xInterface(Interface):
         # Modulation
         ldro = self._should_use_ldro()
         self.radio.set_lora_modulation(self.sf, self.bandwidth, self.cr, ldro)
+        try:
+            pkt = self.radio.get_packet_type()
+            RNS.log(
+                str(self) + " packet_type after init=" + str(pkt)
+                + " (want LoRa=1)",
+                RNS.LOG_INFO,
+            )
+            if pkt != vd.PACKET_TYPE_LORA and hasattr(self.radio, "_ensure_packet_type_lora"):
+                self.radio._ensure_packet_type_lora()
+                RNS.log(
+                    str(self) + " packet_type re-check="
+                    + str(self.radio.get_packet_type()),
+                    RNS.LOG_INFO,
+                )
+        except Exception as e:
+            RNS.log(str(self) + " packet_type check failed: " + str(e), RNS.LOG_WARNING)
 
         # Packet params: explicit header, configurable preamble length
         # (default 8 symbols, override via `preamble_length` config key to
@@ -1419,16 +1448,9 @@ class SX126xInterface(Interface):
         # Sync word
         self.radio.set_sync_word(self.sync_word)
 
-        # CAD parameters for channel-activity-detection-based carrier sense.
-        # The chip's CAD takes cad_symbol_num * t_sym time, so we pick a
-        # conservative 8-symbol window with reasonable detection thresholds.
-        self.radio.set_cad_params(
-            cad_symbol_num=0x08,    # 8 symbols
-            cad_det_peak=0x14,     # peak threshold (chip-internal)
-            cad_det_min=0x0A,      # min threshold (chip-internal)
-            cad_exit_mode=0x00,    # only exit on CAD done
-            cad_timeout=0x008000,   # ~32ms chip-internal timeout
-        )
+        # CAD parameters (SF-aware; see _apply_cad_params).
+        self._cad_timeout_streak = 0
+        self._apply_cad_params()
 
         # Arm the IRQ line as a kernel edge-event so wait_irq_done() can
         # block on it instead of polling. The driver falls back to a 5ms
@@ -1494,13 +1516,8 @@ class SX126xInterface(Interface):
 
             self.radio.set_sync_word(self.sync_word)
 
-            self.radio.set_cad_params(
-                cad_symbol_num=0x08,
-                cad_det_peak=0x14,
-                cad_det_min=0x0A,
-                cad_exit_mode=0x00,
-                cad_timeout=0x008000,
-            )
+            self._apply_cad_params()
+            self._cad_timeout_streak = 0
 
             # Re-arm the IRQ edge subscription in case the line was disturbed
             try:
@@ -1858,6 +1875,18 @@ class SX126xInterface(Interface):
                 self.radio.clear_irq_status(vd.IRQ_RX_DONE | vd.IRQ_CRC_ERR | vd.IRQ_HEADER_ERR)
             except Exception:
                 pass
+            # After RX_DONE the chip often lands in STDBY_RC (0x22) until the
+            # next SetRx. Force continuous RX so we don't sit deaf until the
+            # next CAD/TX path happens to call _enter_rx_mode.
+            try:
+                mode = self.radio.get_status_and_mode()
+                if mode != vd.STATUS_MODE_RX:
+                    self._enter_rx_mode()
+            except Exception:
+                try:
+                    self._enter_rx_mode()
+                except Exception:
+                    pass
 
     def _handle_tx_done(self):
         """Acknowledge IRQ_TX_DONE. The actual frame accounting happens in
@@ -1904,33 +1933,135 @@ class SX126xInterface(Interface):
         self.radio.clear_irq_status(vd.IRQ_ALL)
         self.radio.set_rx(vd.RX_CONTINUOUS)
 
+    def _ensure_lora_packet_type(self):
+        """Re-assert LoRa modem type if the chip dropped it (TCXO/cal paths)."""
+        vd = self.vd
+        try:
+            if hasattr(self.radio, "_ensure_packet_type_lora"):
+                self.radio._ensure_packet_type_lora()
+            else:
+                self.radio.set_packet_type(vd.PACKET_TYPE_LORA)
+        except Exception as e:
+            RNS.log(str(self) + " ensure LoRa packet_type failed: " + str(e),
+                    RNS.LOG_DEBUG)
+
     # -----------------------------------------------------------------
     # Carrier sense (CAD)
     # -----------------------------------------------------------------
+
+    def _cad_params_for_sf(self):
+        """Semtech-ish CAD params scaled by spreading factor.
+
+        Returns (sym_code, det_peak, det_min, n_symbols).
+        sym_code is the SX126x SetCadParams cadSymbolNum field
+        (0=1, 1=2, 2=4, 3=8, 4=16 symbols).
+        """
+        try:
+            sf = int(self.sf)
+        except Exception:
+            sf = 7
+        # Faster CAD on low SF (MeshAdv Mini default SF7): 2 symbols is enough
+        # for preamble detect and keeps host wait under ~10ms airtime.
+        if sf <= 8:
+            sym_code, n_sym = 0x01, 2
+        elif sf <= 10:
+            sym_code, n_sym = 0x02, 4
+        else:
+            sym_code, n_sym = 0x03, 8
+        # detPeak recommendations roughly track RadioLib / Semtech AN tables.
+        peaks = {5: 18, 6: 20, 7: 22, 8: 22, 9: 24, 10: 25, 11: 26, 12: 29}
+        det_peak = peaks.get(sf, 22)
+        return sym_code, det_peak, 0x0A, n_sym
+
+    def _apply_cad_params(self, log=True):
+        """Program chip CAD params for the current SF/BW."""
+        vd = self.vd
+        sym_code, det_peak, det_min, n_sym = self._cad_params_for_sf()
+        self._cad_n_symbols = n_sym
+        # cad_timeout only matters for CAD_RX exit mode; CAD_ONLY (0) exits
+        # on done. Still program a generous value for chip-internal safety.
+        self.radio.set_cad_params(
+            cad_symbol_num=sym_code,
+            cad_det_peak=det_peak,
+            cad_det_min=det_min,
+            cad_exit_mode=0x00,     # CAD_ONLY
+            cad_timeout=0x00FFFF,
+        )
+        if log:
+            RNS.log(
+                str(self) + " CAD params SF=" + str(self.sf)
+                + " symbols=" + str(n_sym)
+                + " det_peak=" + str(det_peak),
+                RNS.LOG_INFO,
+            )
+
+    def _cad_timeout_s(self):
+        """Host-side wait budget for one CAD.
+
+        Chip CAD duration is roughly n_symbols * Tsym. Host SPI + IRQ latency
+        add jitter. Floor 80ms covers SF7/2-sym CAD with margin; SF12 needs more.
+        """
+        try:
+            n_sym = getattr(self, "_cad_n_symbols", None)
+            if n_sym is None:
+                _, _, _, n_sym = self._cad_params_for_sf()
+            tsym = (2 ** int(self.sf)) / float(self.bandwidth)
+            return min(0.4, max(0.08, float(n_sym) * tsym * 4.0 + 0.04))
+        except Exception:
+            return 0.12
 
     def _channel_is_clear(self):
         """CAD-based carrier sense.
 
         Returns True if the channel appears clear (no preamble detected
-        during an 8-symbol CAD window), False if a preamble was detected
-        or the CAD operation failed/timed out. Always returns the chip to
-        RX mode before returning (the chip drops back to STDBY after CAD).
-
-        CAD parameters are configured once in _init_radio().
+        during the CAD window), False if a preamble was detected.
+        CAD host-wait timeouts are retried once; a double timeout is treated
+        as clear (fail open) so a flaky IRQ edge cannot wedge TX forever.
+        A streak of CAD timeouts triggers one radio reinit.
+        Always returns the chip to RX mode before returning.
         """
         vd = self.vd
         try:
-            self.radio.set_standby(vd.STANDBY_RC)
             cad_mask = vd.IRQ_CAD_DONE | vd.IRQ_CAD_DETECTED
-            self.radio.set_dio_irq_params(cad_mask, dio1_mask=cad_mask)
-            self.radio.clear_irq_status(vd.IRQ_ALL)
-            self.radio.set_cad()
+            timeout_s = self._cad_timeout_s()
+            irq = None
 
-            # 8 CAD symbols at SF8/BW125k ≈ 16ms; 50ms is generous.
-            # At SF12/BW125k it's ≈130ms, so on slow configs the CAD itself
-            # may exceed this budget — treat that as "busy" (return False)
-            # which is conservative.
-            irq = self.radio.wait_irq_done(0.05)
+            for attempt in range(2):
+                # CAD needs the RX RF path (LNA / RXEN) live. Leave RXEN on;
+                # DIO2 RF switch follows chip mode when dio2_rf_switch is set.
+                try:
+                    self.radio.set_rx_enable(True)
+                except Exception:
+                    pass
+                # CAD is LoRa-only; GFSK packet type makes CAD_DONE never latch.
+                self._ensure_lora_packet_type()
+                self.radio.set_standby(vd.STANDBY_RC)
+                self.radio.set_dio_irq_params(cad_mask, dio1_mask=cad_mask)
+                self.radio.clear_irq_status(vd.IRQ_ALL)
+                self.radio.set_cad()
+                # Prefer status-poll over pure DIO1 edge wait for CAD. Under the
+                # radio thread, edge-only waits for CAD_DONE were timing out on
+                # MeshAdv Mini even when GetIrqStatus saw CAD_DONE.
+                deadline = time.monotonic() + timeout_s
+                irq = None
+                while time.monotonic() < deadline:
+                    try:
+                        st = self.radio.get_irq_status()
+                    except Exception:
+                        st = 0
+                    if st & cad_mask:
+                        irq = st
+                        break
+                    time.sleep(0.001)
+                if irq is None:
+                    RNS.log(
+                        str(self) + " CAD wait timeout (attempt "
+                        + str(attempt + 1) + "/" + "2, budget "
+                        + "{:.0f}".format(timeout_s * 1000.0) + "ms)",
+                        RNS.LOG_DEBUG,
+                    )
+                if irq is not None:
+                    break
 
             try:
                 self.radio.clear_irq_status(cad_mask)
@@ -1942,7 +2073,30 @@ class SX126xInterface(Interface):
             self._enter_rx_mode()
 
             if irq is None:
-                return False
+                self._cad_timeout_streak = getattr(self, "_cad_timeout_streak", 0) + 1
+                # Fail open: IRQ/CAD flaked twice. Refusing TX here was the
+                # lyra3 MeshAdv Mini failure mode (CSMA 50x busy → ↑0B).
+                RNS.log(
+                    str(self) + " CAD inconclusive after retries; treating channel clear"
+                    + " (streak=" + str(self._cad_timeout_streak) + ")",
+                    RNS.LOG_DEBUG,
+                )
+                # After repeated CAD host timeouts, reinit once to clear wedged
+                # modem state (packet type / IRQ mask / TCXO).
+                if self._cad_timeout_streak >= 8:
+                    self._cad_timeout_streak = 0
+                    RNS.log(
+                        str(self) + " CAD timeout streak; attempting radio reinit",
+                        RNS.LOG_WARNING,
+                    )
+                    try:
+                        self._attempt_reinit()
+                    except Exception as e:
+                        RNS.log(str(self) + " CAD-triggered reinit failed: " + str(e),
+                                RNS.LOG_WARNING)
+                return True
+
+            self._cad_timeout_streak = 0
             return (irq & vd.IRQ_CAD_DETECTED) == 0
 
         except Exception as e:
@@ -1962,7 +2116,10 @@ class SX126xInterface(Interface):
         Returns True if the channel is clear and we should proceed to TX,
         False if we exhausted our backoff attempts (channel busy)."""
         slot_time = self.csma_slot_ms / 1000.0
-        max_attempts = self.csma_max_backoff * 10
+        # max_backoff=5 → 50 attempts was noisy when CAD itself was broken.
+        # Keep the same formula but clamp so a single packet can't burn
+        # seconds of radio-thread time under persistent busy.
+        max_attempts = min(self.csma_max_backoff * 10, 24)
 
         for attempt in range(max_attempts):
             if self._stop_event.is_set():
@@ -2018,7 +2175,8 @@ class SX126xInterface(Interface):
         # CSMA
         if not self._csma_wait():
             RNS.log(str(self) + " dropping packet: CSMA gave up after "
-                    + str(self.csma_max_backoff * 10) + " attempts (channel busy)",
+                    + str(min(self.csma_max_backoff * 10, 24))
+                    + " attempts (channel busy)",
                     RNS.LOG_WARNING)
             return
 
@@ -2056,84 +2214,162 @@ class SX126xInterface(Interface):
             if not self._handle_spi_failure("re_enter_rx_after_tx", e):
                 return
 
+    def _wait_tx_irq(self, timeout_s):
+        """Wait for TX_DONE or TIMEOUT via poll-first hybrid wait.
+
+        Edge-only waits missed TX_DONE under radio-thread load on MeshAdv
+        Mini; continuous GetIrqStatus polling (with short edge chunks inside
+        wait_irq_done) is the reliable path.
+        """
+        vd = self.vd
+        mask = vd.IRQ_TX_DONE | vd.IRQ_TIMEOUT
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+        while time.monotonic() < deadline:
+            try:
+                st = self.radio.get_irq_status()
+            except Exception:
+                st = 0
+            if st & mask:
+                return st
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Short hybrid wait: chunked edge + status poll inside driver.
+            chunk = remaining if remaining < 0.05 else 0.05
+            try:
+                irq = self.radio.wait_irq_done(chunk)
+            except Exception:
+                irq = None
+            if irq is not None and (irq & mask):
+                return irq
+        try:
+            st = self.radio.get_irq_status()
+            if st & mask:
+                return st
+        except Exception:
+            pass
+        return None
+
     def _transmit_frame_blocking(self, frame):
         """Transmit a single LoRa frame and block until TX done or timeout.
 
         Returns True on IRQ_TX_DONE, False on timeout / IRQ_TIMEOUT / error.
-        On timeout we still try to put the chip back into standby so the
-        next operation can recover."""
+        Retries SetTx once on host-side wait failure. On timeout we still try
+        to put the chip back into standby so the next operation can recover.
+        """
         vd = self.vd
 
-        # Per-frame TX timeout: 1.5x the frame's TOA + 1s margin, clamped
-        # to a sane range. This bounds shutdown latency while covering the
-        # worst-case (SF=12, BW=125k, 254-byte payload ≈ 9s).
+        # Per-frame TX timeout: 1.5x the frame's TOA + margin, clamped.
+        # SF7 short frames finish in tens of ms; keep a 0.5s floor so a
+        # slow host poll still catches TX_DONE without multi-second stalls.
         toa = self._calculate_toa(len(frame))
-        timeout_s = max(min(toa * 1.5 + 1.0, 15.0), 1.0)
+        timeout_s = max(min(toa * 1.5 + 0.5, 15.0), 0.5)
 
-        # Chip-internal TX timeout: 0 = "no chip-side timeout" (TX_SINGLE
-        # convention from LoRaRF-Python). The chip will only signal TX_DONE
-        # or, on a stuck-state chip, never signal at all (caught by the
-        # host-side wait_irq_done above). We previously set a chip-side
-        # timeout of 1.2x TOA here, but on some SX1262 firmware states a
-        # rejected SetTx (status 0x2a) immediately fires IRQ_TIMEOUT
-        # (~1ms), which is indistinguishable from a real TX timeout and
-        # confuses the host. Letting the chip use TX_SINGLE and trusting
-        # the host-side wait_irq_done is cleaner.
+        # Chip-internal TX timeout: 0 = TX_SINGLE (no chip-side timeout).
+        # Rejected SetTx can still latch IRQ_TIMEOUT immediately on some
+        # SX1262 states — we treat that as retryable failure.
         chip_timeout_units = 0x000000
 
+        last_irq = None
+        last_status = None
         try:
-            self.radio.set_standby(vd.STANDBY_RC)
-            # Drive the board's external TXEN/RXEN GPIOs (if any) so the
-            # E22 module's PA path is enabled for TX. The vendored driver's
-            # set_tx_enable() is a no-op when self._line_txen is None (i.e.
-            # when the board profile set header_pin_txen = -1, as the
-            # Femtofox-integrated profile does), so this is safe for both
-            # "TXEN bridged to DIO2" and "TXEN on a separate GPIO" boards.
-            self.radio.set_tx_enable(True)
-            # Set the LoRa packet params with the EXACT payload length
-            # we are about to transmit — per SX126x datasheet §13.4.6,
-            # payloadLength is the number of bytes the modem transmits, NOT
-            # a maximum. Using LORA_MAX_PAYLOAD here would cause the chip
-            # to transmit len(frame) real bytes followed by (255-len(frame))
-            # bytes of stale TX-buffer garbage, with the LoRa header
-            # declaring length 255 and the CRC computed over all 255 bytes
-            # — making the resulting RX_DONE clean (LoRa-level decode
-            # succeeds) but the payload = real-packet-plus-garbage, which
-            # Reticulum's higher-layer validation silently rejects.
-            self.radio.set_lora_packet(
-                vd.HEADER_EXPLICIT,
-                self.preamble_length,
-                len(frame),
-                True,
-                False,
-            )
-            self.radio.set_buffer_base_address(0, 0)
-            self.radio.clear_irq_status(vd.IRQ_ALL)
-            self.radio.set_dio_irq_params(
-                vd.IRQ_TX_DONE | vd.IRQ_TIMEOUT,
-                dio1_mask=vd.IRQ_TX_DONE | vd.IRQ_TIMEOUT,
-            )
-            self.radio.write_buffer(0, frame)
-            self.radio.set_tx(chip_timeout_units)
-            irq = self.radio.wait_irq_done(timeout_s)
-            try:
-                self.radio.clear_irq_status(vd.IRQ_TX_DONE | vd.IRQ_TIMEOUT)
-            except Exception:
-                pass
-            # Restore TXEN/RXEN to their pre-TX state. No-op when the
-            # board doesn't define them.
-            self.radio.restore_tx_rx_pins()
+            for attempt in range(2):
+                self._ensure_lora_packet_type()
+                self.radio.set_standby(vd.STANDBY_RC)
+                # Drive external TXEN/RXEN for the RF front-end. Even when
+                # pin_txen=-1 (MeshAdv Mini / DIO2-as-RF-switch), set_tx_enable
+                # still deasserts RXEN so the LNA is off during TX.
+                self.radio.set_tx_enable(True)
+                # payloadLength MUST equal len(frame) — datasheet §13.4.6.
+                self.radio.set_lora_packet(
+                    vd.HEADER_EXPLICIT,
+                    self.preamble_length,
+                    len(frame),
+                    True,
+                    False,
+                )
+                self.radio.set_buffer_base_address(0, 0)
+                self.radio.clear_irq_status(vd.IRQ_ALL)
+                self.radio.set_dio_irq_params(
+                    vd.IRQ_TX_DONE | vd.IRQ_TIMEOUT,
+                    dio1_mask=vd.IRQ_TX_DONE | vd.IRQ_TIMEOUT,
+                )
+                self.radio.write_buffer(0, frame)
+                self.radio.set_tx(chip_timeout_units)
 
-            if irq is None:
+                # Confirm the chip actually entered TX (or already finished).
+                try:
+                    last_status = self.radio.get_status_byte()
+                    mode = last_status & 0x70
+                    if mode not in (vd.STATUS_MODE_TX, vd.STATUS_MODE_STDBY_RC,
+                                    vd.STATUS_MODE_STDBY_XOSC, vd.STATUS_MODE_FS):
+                        RNS.log(
+                            str(self) + " unexpected mode after SetTx: "
+                            + "status=0x{:02x}".format(last_status)
+                            + " (attempt " + str(attempt + 1) + "/2)",
+                            RNS.LOG_DEBUG,
+                        )
+                except Exception:
+                    pass
+
+                irq = self._wait_tx_irq(timeout_s)
+                last_irq = irq
+                try:
+                    self.radio.clear_irq_status(vd.IRQ_TX_DONE | vd.IRQ_TIMEOUT)
+                except Exception:
+                    pass
+                self.radio.restore_tx_rx_pins()
+
+                if irq is not None and (irq & vd.IRQ_TX_DONE) and not (irq & vd.IRQ_TIMEOUT):
+                    return True
+
+                # Snapshot diagnostics before retry / fail.
+                try:
+                    last_status = self.radio.get_status_byte()
+                except Exception:
+                    pass
+                if irq is None:
+                    RNS.log(
+                        str(self) + " TX wait timed out (attempt "
+                        + str(attempt + 1) + "/2, toa="
+                        + "{:.3f}".format(toa) + "s"
+                        + " status=0x{:02x}".format(last_status if last_status is not None else 0)
+                        + ")",
+                        RNS.LOG_WARNING if attempt == 1 else RNS.LOG_DEBUG,
+                    )
+                elif irq & vd.IRQ_TIMEOUT:
+                    RNS.log(
+                        str(self) + " TX reported timeout IRQ (attempt "
+                        + str(attempt + 1) + "/2"
+                        + " irq=0x{:04x}".format(irq)
+                        + " status=0x{:02x}".format(last_status if last_status is not None else 0)
+                        + ")",
+                        RNS.LOG_WARNING if attempt == 1 else RNS.LOG_DEBUG,
+                    )
+                else:
+                    RNS.log(
+                        str(self) + " TX incomplete irq=0x{:04x}".format(irq)
+                        + " (attempt " + str(attempt + 1) + "/2)",
+                        RNS.LOG_DEBUG,
+                    )
+
+                # Brief settle before retry.
+                try:
+                    self.radio.set_standby(vd.STANDBY_RC)
+                except Exception:
+                    pass
+                time.sleep(0.005)
+
+            if last_irq is None:
                 RNS.log(str(self) + " TX wait timed out", RNS.LOG_WARNING)
-                return False
-            if irq & vd.IRQ_TIMEOUT:
-                RNS.log(str(self) + " TX reported timeout IRQ", RNS.LOG_WARNING)
-                return False
-            return bool(irq & vd.IRQ_TX_DONE)
+            return False
         except Exception:
             # Bubble up to _drain_tx_queue, which will run it through
             # _handle_spi_failure.
+            try:
+                self.radio.restore_tx_rx_pins()
+            except Exception:
+                pass
             raise
 
     # -----------------------------------------------------------------

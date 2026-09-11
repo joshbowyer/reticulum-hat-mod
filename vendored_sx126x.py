@@ -629,8 +629,37 @@ class SX126xRadio:
                 self.clear_device_errors()
             except Exception:
                 pass
+            # Calibrate(0xFF) can leave packet type at the chip default
+            # (GFSK=0) or leave the modem briefly unwilling to accept
+            # SetPacketType. MeshAdv Mini then ran LoRa TX/RX/CAD while
+            # GetPacketType still read 0: CAD never completed (CSMA wedged
+            # at ↑0B) and RF decode was unreliable. Re-assert LoRa and
+            # verify it stuck.
+            self._ensure_packet_type_lora()
 
         return True
+
+    def _ensure_packet_type_lora(self):
+        """Set PACKET_TYPE_LORA and confirm via GetPacketType.
+
+        TCXO calibrate / cold start has been observed to leave the type at
+        GFSK (0) or to ignore the first SetPacketType; without this check
+        CAD and LoRa RX path run in the wrong modem mode.
+        """
+        for _ in range(5):
+            self.set_standby(STANDBY_RC)
+            self.set_packet_type(PACKET_TYPE_LORA)
+            # Brief settle — BUSY alone was not always enough right after
+            # Calibrate(0xFF) on DIO3-TCXO boards.
+            time.sleep(0.01)
+            try:
+                if self.get_packet_type() == PACKET_TYPE_LORA:
+                    return
+            except Exception:
+                pass
+        # Last attempt without raising — caller still wants open() to succeed;
+        # interface init will call set_packet_type again.
+        self.set_packet_type(PACKET_TYPE_LORA)
 
     def close(self):
         """Sleep the chip and release every hardware handle. Safe to call
@@ -697,7 +726,10 @@ class SX126xRadio:
 
     def _spi_write(self, opcode, data=b""):
         """Issue a write-only SX126x command: [opcode, data...].
-        Blocks on BUSY first (mandatory before any SPI transaction)."""
+        Blocks on BUSY before and after (datasheet: BUSY goes high during
+        command processing; reading back too early returned stale/zero
+        values — e.g. GetPacketType stayed 0 after SetPacketType on TCXO
+        boards, which left CAD/CSMA wedged)."""
         if self._wait_busy(self.busy_timeout_ms) is False:
             raise SX126xTimeout("BUSY pin stayed high before opcode 0x{:02x}".format(opcode))
         buf = bytes([opcode]) + (data if isinstance(data, (bytes, bytearray)) else bytes(data))
@@ -710,6 +742,8 @@ class SX126xRadio:
                 self._line_cs.set_value(self.pin_cs, self.HIGH)
         else:
             self._spi.xfer2(list(buf))
+        if self._wait_busy(self.busy_timeout_ms) is False:
+            raise SX126xTimeout("BUSY pin stayed high after opcode 0x{:02x}".format(opcode))
 
     def _spi_read(self, opcode, address=b"", n_data=1):
         """Issue a read SX126x command: [opcode, address..., 0x00 * (n_data+1)].
@@ -744,6 +778,9 @@ class SX126xRadio:
                 self._line_cs.set_value(self.pin_cs, self.HIGH)
         else:
             feedback = self._spi.xfer2(list(buf))
+        # Do NOT wait-BUSY after reads: CAD/TX poll GetIrqStatus in a tight
+        # loop and an after-read wait was observed to stretch/abort CAD on
+        # MeshAdv Mini. Writes still wait BUSY after (see _spi_write).
         # Layout of feedback:
         #   feedback[0]            = STATUS byte (auto-clocked on every read)
         #   feedback[1..n_addr]    = echoed address bytes
@@ -1105,31 +1142,63 @@ class SX126xRadio:
                     irq = self.get_irq_status()
                     if irq != 0:
                         return irq
-                # Edge-wait path — blocks in the kernel until the line fires.
-                remaining = deadline - time.monotonic()
-                if remaining < 0:
-                    remaining = 0.0
-                fired = self._line_irq.wait_edge_events(remaining)
-                if not fired:
-                    return None
-                # Drain the event so the next wait_irq_done() can re-arm.
+                # Chunked edge-wait + status poll. A single long wait_edge_events
+                # misses the common race where CAD/TX completes and latches
+                # DIO1 high *before* the wait is armed (or the kernel drops
+                # the edge under load). Polling GetIrqStatus between short
+                # edge waits recovers within ~25ms instead of the full timeout
+                # (which is what made live TX look like "wait timed out" on
+                # MeshAdv Mini even after a successful chip TX_DONE).
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    chunk = remaining if remaining < 0.025 else 0.025
+                    fired = self._line_irq.wait_edge_events(chunk)
+                    if fired:
+                        try:
+                            self._line_irq.read_edge_events()
+                        except Exception:
+                            pass
+                        irq = self.get_irq_status()
+                        if irq != 0:
+                            return irq
+                        # Edge without latched status — keep waiting.
+                        continue
+                    # No edge this chunk: poll chip + pin level.
+                    irq = self.get_irq_status()
+                    if irq != 0:
+                        return irq
+                    try:
+                        if self._line_irq.get_value(self.pin_irq) == self.HIGH:
+                            irq = self.get_irq_status()
+                            if irq != 0:
+                                return irq
+                    except Exception:
+                        pass
+                # Final recovery poll after deadline.
+                irq = self.get_irq_status()
+                if irq != 0:
+                    return irq
                 try:
-                    self._line_irq.read_edge_events()
+                    if self._line_irq.get_value(self.pin_irq) == self.HIGH:
+                        irq = self.get_irq_status()
+                        if irq != 0:
+                            return irq
                 except Exception:
                     pass
-                return self.get_irq_status()
+                return None
             else:
                 # Polling fallback for boards without a wired IRQ pin.
-                # 5ms sleep ≈ 200Hz poll, which is plenty for LoRa packet
-                # turnaround times (hundreds of ms typically) and burns
-                # effectively zero CPU.
+                # 2ms sleep ≈ 500Hz poll — fine for LoRa turnaround and
+                # recovers CAD_DONE / TX_DONE without busy-spinning.
                 while True:
                     irq = self.get_irq_status()
                     if irq != 0:
                         return irq
                     if time.monotonic() >= deadline:
                         return None
-                    time.sleep(0.005)
+                    time.sleep(0.002)
 
     # ------------------------------------------------------------------
     # High-level composition helpers (used by SX126xInterface layer)
@@ -1295,28 +1364,47 @@ class SX126xRadio:
         return self.HIGH if enabled else self.LOW
 
     def set_tx_enable(self, on):
-        """Drive the external TXEN pin (if wired). Saves the prior state
-        so the caller can restore it after TX."""
-        if self._line_txen is None:
-            return
+        """Arm/disarm the external TX path.
+
+        When enabling TX:
+          - assert TXEN if wired
+          - deassert RXEN if wired (LNA must be off during TX)
+
+        Boards with pin_txen=-1 (MeshAdv Mini, DIO2-as-RF-switch) still
+        need RXEN dropped. An early return on missing TXEN previously left
+        RXEN high through the entire TX window.
+        """
         if on:
-            self._tx_state = self._line_txen.get_value(self.pin_txen)
-            self._line_txen.set_value(self.pin_txen, self._txen_level(True))
+            if self._line_txen is not None:
+                self._tx_state = self._line_txen.get_value(self.pin_txen)
+                self._line_txen.set_value(self.pin_txen, self._txen_level(True))
             if self._line_rxen is not None:
                 self._rx_state = self._line_rxen.get_value(self.pin_rxen)
                 self._line_rxen.set_value(self.pin_rxen, self._rxen_level(False))
+        else:
+            if self._line_txen is not None:
+                self._line_txen.set_value(self.pin_txen, self._txen_level(False))
 
     def set_rx_enable(self, on):
-        """Drive the external RXEN pin (if wired). Saves the prior state
-        so the caller can restore it after RX."""
-        if self._line_rxen is None:
-            return
+        """Arm/disarm the external RX path.
+
+        When enabling RX:
+          - assert RXEN if wired
+          - deassert TXEN if wired (PA must be off during RX)
+
+        set_rx_enable(False) must actually drop RXEN — the previous
+        implementation only handled on=True and left RXEN stuck high.
+        """
         if on:
-            self._rx_state = self._line_rxen.get_value(self.pin_rxen)
-            self._line_rxen.set_value(self.pin_rxen, self._rxen_level(True))
+            if self._line_rxen is not None:
+                self._rx_state = self._line_rxen.get_value(self.pin_rxen)
+                self._line_rxen.set_value(self.pin_rxen, self._rxen_level(True))
             if self._line_txen is not None:
                 self._tx_state = self._line_txen.get_value(self.pin_txen)
                 self._line_txen.set_value(self.pin_txen, self._txen_level(False))
+        else:
+            if self._line_rxen is not None:
+                self._line_rxen.set_value(self.pin_rxen, self._rxen_level(False))
 
     def restore_tx_rx_pins(self):
         """Restore TXEN/RXEN to whatever they were before the most recent
